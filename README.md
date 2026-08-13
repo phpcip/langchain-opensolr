@@ -3,6 +3,10 @@
 LangChain integration for [Opensolr](https://opensolr.com) — managed Apache Solr
 with **server-side embeddings** and native **hybrid (BM25 + kNN) search**.
 
+**Product page:** [opensolr.com/langchain](https://opensolr.com/langchain) ·
+**Platform:** [opensolr.com](https://opensolr.com) (managed Solr hosting since 2011 —
+free 15-day trial, no card)
+
 No local embedding model. No third-party embedding API key. One set of
 credentials, and the vectors are computed on Opensolr's GPU infrastructure
 (multilingual E5-large-instruct, 1024 dimensions, cosine).
