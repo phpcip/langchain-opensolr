@@ -138,9 +138,16 @@ class OpensolrClient:
                 f"Currently available: {sorted(live)}. Additional regions can "
                 f"be deployed on request — contact support@opensolr.com."
             )
-        return self.mgmt(
-            "create_index", index_name=index, core_type="generic", server_country=env
+        # create_index reads its params from the query string (GET) server-side
+        resp = self._http.post(
+            f"{MGMT_BASE}/create_index",
+            params={"index_name": index, "core_type": "generic", "server_country": env},
+            data=self._auth_params(),
         )
+        body = resp.json()
+        if isinstance(body, dict) and body.get("status") is False:
+            raise OpensolrError(f"create_index: {body.get('msg', body)}")
+        return body
 
     # ------------------------------------------------------------------ #
     # AI                                                                 #
