@@ -309,7 +309,15 @@ class OpensolrClient:
         docs: Optional[int] = None,
         words: Optional[int] = None,
     ) -> str:
-        """Build the LLM context from the top hybrid search hits."""
+        """Build the LLM context from the top hybrid search hits.
+
+        Retrieval runs through the server-side ``embed_and_search`` pipeline —
+        the platform's own tuned hybrid ranking (field weights, minimum-match,
+        quality boosts), the same machinery behind the hosted search UI, so it
+        improves automatically with the platform. When a custom ``fq`` is
+        given (which that endpoint doesn't accept) — or if it fails —
+        retrieval falls back to the client-side ``{!hybrid}`` query.
+        """
 
         def _flat(v: Any) -> str:
             if isinstance(v, list):
@@ -318,11 +326,21 @@ class OpensolrClient:
 
         docs = docs or self.RAG_DOCS
         words = words or self.RAG_WORDS
-        body = self.hybrid_search(
-            index, query, rows=docs, fl="title,description,text", fq=fq
-        )
+        hits: List[Dict[str, Any]] = []
+        if not fq:
+            try:
+                body = self.embed_and_search(index, query, rows=docs)
+                if isinstance(body, dict):
+                    hits = body.get("results", {}).get("docs", []) or []
+            except (OpensolrError, httpx.HTTPError):
+                hits = []
+        if not hits:
+            body = self.hybrid_search(
+                index, query, rows=docs, fl="title,description,text", fq=fq
+            )
+            hits = body.get("response", {}).get("docs", [])
         parts: List[str] = []
-        for doc in body.get("response", {}).get("docs", []):
+        for doc in hits[:docs]:
             text_words = _flat(doc.get("text")).split()[:words]
             parts.append(
                 _flat(doc.get("title")) + " - "
