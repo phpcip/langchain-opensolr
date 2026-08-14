@@ -108,8 +108,10 @@ Writes go through Opensolr's [Data Ingestion API](https://opensolr.com/learn/api
 — the same pipeline the Drupal and WordPress connectors use. It is
 **asynchronous**: documents are queued, then embeddings, sentiment, language
 and all crawler-identical derived fields are computed **server-side**, and
-documents become searchable within about a minute. Progress is visible in the
-Opensolr Control Panel and via the `ingest_status` API. Each document's
+documents become searchable within about a minute. Progress is visible in
+**Control Panel → Data Ingestion** — a per-job status board (queued /
+processing / completed / failed, with processed / success / failed document
+counts per job) — and via the `ingest_status` API. Each document's
 identity is its `uri` (the Solr id is `md5(uri)`): pass a real URL in
 metadata (`{"uri": "https://..."}`), or a deterministic one is synthesized
 from your id. Re-submitting the same `uri` updates the document. Pass
