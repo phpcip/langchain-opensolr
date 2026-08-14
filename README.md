@@ -102,4 +102,33 @@ pytest tests/unit_tests
 OPENSOLR_EMAIL=... OPENSOLR_API_KEY=... OPENSOLR_INDEX=... pytest tests/integration_tests
 ```
 
+## How writing works (Data Ingestion API)
+
+Writes go through Opensolr's [Data Ingestion API](https://opensolr.com/learn/api-data-ingestion/204/data-ingestion-api-push-documents-to-your-opensolr-index-programmatically)
+— the same pipeline the Drupal and WordPress connectors use. It is
+**asynchronous**: documents are queued, then embeddings, sentiment, language
+and all crawler-identical derived fields are computed **server-side**, and
+documents become searchable within about a minute. Progress is visible in the
+Opensolr Control Panel and via the `ingest_status` API. Each document's
+identity is its `uri` (the Solr id is `md5(uri)`): pass a real URL in
+metadata (`{"uri": "https://..."}`), or a deterministic one is synthesized
+from your id. Re-submitting the same `uri` updates the document. Pass
+`{"rtf": True, "uri": "https://.../file.pdf"}` and the server extracts the
+text from PDF/DOCX/XLSX for you.
+
+## Lexical-only mode
+
+Don't need vectors? Pure keyword search skips the embedding call entirely —
+zero AI quota, and it works on **any** Opensolr index, including non-vector
+ones and older Solr versions.
+
+## Your index schema
+
+Documents follow the Opensolr document model (`title`, `description`, `text`,
+`meta_*` custom fields). To see the full schema: **Control Panel → click your
+index → Configuration → Edit File → schema.xml**. Prefer zero-effort data
+entry? Configure the **Web Crawler** in the Control Panel (Index Tools →
+WebCrawler): add your site URL, validate it, and Opensolr indexes the whole
+site for you.
+
 MIT license.

@@ -46,9 +46,59 @@ _INTERNAL_FIELDS = {
 
 _META_KEY_RE = re.compile(r"[^a-z0-9_]+")
 
+#: Metadata keys that map to first-class ingestion fields, not meta_* copies.
+_RESERVED_META = {"uri", "url", "title", "description", "timestamp", "rtf", "author", "category", "content_type", "og_image"}
+
 
 def _sanitize_meta_key(key: str) -> str:
     return _META_KEY_RE.sub("_", key.lower()).strip("_")
+
+
+def _uri_for(index: str, doc_id: str, metadata: Optional[dict]) -> str:
+    """Document identity = its URI (Data Ingestion contract: id = md5(uri)).
+
+    Uses metadata['uri'] / metadata['url'] when it is a real http(s) URL,
+    otherwise synthesizes a deterministic one from the caller's id.
+    """
+    from urllib.parse import quote
+
+    meta = metadata or {}
+    uri = meta.get("uri") or meta.get("url")
+    if not (isinstance(uri, str) and uri.startswith(("http://", "https://"))):
+        uri = f"https://ingest.opensolr.com/{index}/{quote(str(doc_id), safe='')}"
+    return uri.rstrip("/")
+
+
+def _ingest_doc(index: str, text: str, metadata: Optional[dict], doc_id: str) -> Dict[str, Any]:
+    """Build one Data Ingestion API document (uri/title/description/text
+    required; custom metadata as meta_* fields; lossless meta_lc_json)."""
+    import hashlib
+
+    meta = dict(metadata or {})
+    uri = _uri_for(index, doc_id, meta)
+    text = text or " "
+    doc: Dict[str, Any] = {
+        "uri": uri,
+        "title": str(meta.get("title") or text[:100] or uri)[:250],
+        "description": str(meta.get("description") or text[:200]),
+        "text": text,
+        "meta_ext_id": str(doc_id),
+        "meta_lc_json": json.dumps(meta, ensure_ascii=False),
+    }
+    if meta.get("rtf"):
+        doc["rtf"] = True
+    if meta.get("timestamp"):
+        doc["timestamp"] = meta["timestamp"]
+    for opt in ("author", "category", "content_type", "og_image"):
+        if meta.get(opt):
+            doc[opt] = str(meta[opt])
+    for key, value in meta.items():
+        if isinstance(value, (str, int, float, bool)) and key not in ("rtf", "uri", "url"):
+            field = f"meta_{_sanitize_meta_key(str(key))}"
+            if field not in ("meta_lc_json", "meta_ext_id"):
+                doc[field] = str(value)
+    doc["_solr_id"] = hashlib.md5(uri.encode()).hexdigest()
+    return doc
 
 
 def _escape_fq_value(value: str) -> str:
@@ -130,7 +180,7 @@ class OpensolrVectorStore(VectorStore):
         """Server-side embeddings bound to this index."""
         return OpensolrEmbeddings(client=self._client, index=self._index)
 
-    def _ensure_index(self) -> None:
+    def _ensure_index(self, check_vector: bool = True) -> None:
         if self._checked:
             return
         try:
@@ -150,11 +200,11 @@ class OpensolrVectorStore(VectorStore):
             if info is None:
                 raise
         version = str(info.get("solr_version", ""))
-        if version and not version.startswith("9"):
+        if check_vector and version and not version.startswith("9"):
             raise OpensolrError(
                 f"Index {self._index!r} runs Solr {version}, but vector search "
-                f"requires Solr 9.x. Create the index in one of the vector-enabled "
-                f"locations: {sorted(VECTOR_LOCATIONS)}."
+                f"requires Solr 9.x. Use lexical=True for keyword-only search on "
+                f"this index, or create a vector index in: {sorted(VECTOR_LOCATIONS)}."
             )
         self._checked = True
 
@@ -213,56 +263,73 @@ class OpensolrVectorStore(VectorStore):
         texts: Iterable[str],
         metadatas: Optional[List[dict]] = None,
         ids: Optional[List[str]] = None,
+        wait: bool = False,
         **kwargs: Any,
     ) -> List[str]:
+        """Queue texts through the Opensolr Data Ingestion API.
+
+        Ingestion is ASYNC: embeddings and all derived fields are computed
+        server-side and documents become searchable within ~1 minute (the
+        queue is processed every minute; progress is visible in the Control
+        Panel and via ``client.ingest_status``). Pass ``wait=True`` to block
+        until the job completes. Returns the Solr document ids (md5 of each
+        document's URI, per the ingestion contract).
+        """
         texts = list(texts)
         if not texts:
             return []
-        self._ensure_index()
+        self._ensure_index(check_vector=False)
         metadatas = metadatas or [{} for _ in texts]
         ids = ids or [str(uuid.uuid4()) for _ in texts]
         if not (len(texts) == len(metadatas) == len(ids)):
             raise ValueError("texts, metadatas and ids must have the same length")
 
-        vectors = self._client.batch_embed(self._index, texts)
+        docs = [
+            _ingest_doc(self._index, text, meta, doc_id)
+            for text, meta, doc_id in zip(texts, metadatas, ids)
+        ]
+        solr_ids = [d.pop("_solr_id") for d in docs]
+        for i in range(0, len(docs), 50):
+            self._client.ingest(self._index, docs[i : i + 50], wait=wait)
+        return solr_ids
 
-        docs = []
-        for text, meta, doc_id, vector in zip(texts, metadatas, ids, vectors):
-            doc: Dict[str, Any] = {
-                "id": doc_id,
-                self._text_field: text,
-                self._vector_field: vector,
-                "meta_lc_json": json.dumps(meta, ensure_ascii=False),
-            }
-            title = meta.get("title") if isinstance(meta, dict) else None
-            doc["title"] = str(title) if title else text[:100]
-            for key, value in (meta or {}).items():
-                if _scalar(value):
-                    field = f"meta_{_sanitize_meta_key(key)}"
-                    if field not in ("meta_lc_json",):
-                        doc[field] = str(value)
-            docs.append(doc)
-
-        self._client.solr_update(self._index, docs)
-        return ids
-
-    def delete(self, ids: Optional[List[str]] = None, **kwargs: Any) -> Optional[bool]:
-        self._ensure_index()
+    def delete(
+        self,
+        ids: Optional[List[str]] = None,
+        query: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Optional[bool]:
+        """Delete by ids (Solr ids or your original ids) or by a raw Solr query."""
+        self._ensure_index(check_vector=False)
+        if query:
+            self._client.solr_update(self._index, {"delete": {"query": query}})
+            return True
         if ids is None:
             if kwargs.get("delete_all"):
                 self._client.solr_update(self._index, {"delete": {"query": "*:*"}})
                 return True
-            raise ValueError("Provide ids, or delete_all=True to clear the index")
-        self._client.solr_update(self._index, {"delete": list(ids)})
+            raise ValueError("Provide ids, query=..., or delete_all=True")
+        joined = " OR ".join(f'"{_escape_fq_value(str(i))}"' for i in ids)
+        self._client.solr_update(
+            self._index,
+            {"delete": {"query": f"id:({joined}) OR meta_ext_id:({joined})"}},
+        )
         return True
 
     def get_by_ids(self, ids: Sequence[str], /) -> List[Document]:
-        self._ensure_index()
+        self._ensure_index(check_vector=False)
         joined = " OR ".join(f'"{_escape_fq_value(str(i))}"' for i in ids)
         body = self._client.solr_select(
-            self._index, {"q": f"id:({joined})", "rows": len(ids), "fl": "*"}
+            self._index,
+            {"q": f"id:({joined}) OR meta_ext_id:({joined})", "rows": max(len(ids), 10), "fl": "*"},
         )
-        found = {d.id: d for d in map(self._doc_from_solr, body["response"]["docs"])}
+        docs = [self._doc_from_solr(d) for d in body["response"]["docs"]]
+        found = {d.id: d for d in docs}
+        for d, raw in zip(docs, body["response"]["docs"]):
+            ext = raw.get("meta_ext_id")
+            ext = ext[0] if isinstance(ext, list) else ext
+            if ext:
+                found.setdefault(str(ext), d)
         return [found[i] for i in ids if i in found]
 
     # ------------------------------------------------------------------ #
@@ -279,6 +346,7 @@ class OpensolrVectorStore(VectorStore):
         k: int = 4,
         filter: Optional[Any] = None,
         hybrid: bool = False,
+        lexical: bool = False,
         mode: str = "union",
         alpha: float = 0.5,
         **kwargs: Any,
@@ -286,25 +354,40 @@ class OpensolrVectorStore(VectorStore):
         """Return documents most similar to ``query`` with their scores.
 
         Args:
-            query: Natural language query. Embedded server-side.
+            query: Natural language query. Embedded server-side (unless lexical).
             k: Number of documents to return.
             filter: Metadata filter — a dict (``{"key": "value"}`` matches the
                 ``meta_key`` field), a raw Solr ``fq`` string, or a list of them.
             hybrid: Fuse BM25 (lexical) and kNN (semantic) scores per document
                 using Opensolr's ``{!hybrid}`` query parser instead of pure kNN.
+            lexical: Pure keyword (edismax) search — no embedding call, zero AI
+                quota, and works on ANY Opensolr index, including non-vector
+                and older Solr versions.
             mode: Hybrid mode — ``union`` (default), ``keywords_required``,
                 ``meaning_required`` or ``intersection``.
             alpha: Hybrid semantic↔lexical balance, 0 = all semantic,
                 1 = all lexical.
         """
-        self._ensure_index()
-        vector = self._client.embed(self._index, query, is_query=True)
-        knn = self._knn_query(vector, max(k, 10))
+        self._ensure_index(check_vector=not lexical)
 
         params: Dict[str, Any] = {
             "rows": k,
             "fl": "*,score",
         }
+        if lexical:
+            clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
+            params["q"] = f'{{!edismax qf="title^100 description^20 {self._text_field}^1"}}{clean}'
+            for fq in self._filter_to_fq(filter):
+                params.setdefault("fq", [])
+                params["fq"].append(fq)
+            body = self._client.solr_select(self._index, params)
+            return [
+                (self._doc_from_solr(d), float(d.get("score", 0.0)))
+                for d in body["response"]["docs"]
+            ]
+
+        vector = self._client.embed(self._index, query, is_query=True)
+        knn = self._knn_query(vector, max(k, 10))
         if hybrid:
             if mode not in _HYBRID_MODES:
                 raise ValueError(f"mode must be one of {_HYBRID_MODES}, got {mode!r}")

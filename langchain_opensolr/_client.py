@@ -179,6 +179,52 @@ class OpensolrClient:
             out.extend(embeddings)
         return out
 
+    def ingest(self, index: str, documents: List[Dict[str, Any]], wait: bool = False, timeout: float = 180.0) -> Dict[str, Any]:
+        """Queue documents through the Opensolr Data Ingestion API (async).
+
+        Embeddings, sentiment, language detection, and all crawler-identical
+        derived fields are computed server-side. Max 50 documents per call.
+        Returns ``{status, msg, job_id, total_docs, doc_ids}``. With
+        ``wait=True``, polls ``ingest_status`` until the job completes
+        (the queue is processed every minute).
+        """
+        resp = self._http.post(
+            f"{AI_BASE}/ingest",
+            json={**self._auth_params(), "core_name": index, "documents": documents},
+        )
+        try:
+            body = resp.json()
+        except json.JSONDecodeError as exc:
+            raise OpensolrError(f"ingest: non-JSON response: {resp.text[:200]}") from exc
+        if isinstance(body, dict) and body.get("status") is False:
+            raise OpensolrError(f"ingest: {body.get('msg', body)}: {body.get('errors', '')}")
+        if wait and body.get("job_id"):
+            import time
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                st = self.ingest_status(body["job_id"])
+                job = st.get("job", {}) if isinstance(st, dict) else {}
+                state = int(job.get("state", 0)) if str(job.get("state", "")).lstrip("-").isdigit() else 0
+                if state == 1:
+                    body["final_status"] = st
+                    return body
+                if state in (3, 4):
+                    raise OpensolrError(f"ingest: job {body['job_id']} {job.get('state_label', state)}: {job.get('error')}")
+                time.sleep(5)
+            raise OpensolrError(f"ingest: job {body['job_id']} not completed within {timeout}s")
+        return body
+
+    def ingest_status(self, job_id: str) -> Dict[str, Any]:
+        """Status of an ingestion job (also visible in the Control Panel)."""
+        resp = self._http.post(
+            f"{AI_BASE}/ingest_status",
+            data={**self._auth_params(), "job_id": job_id},
+        )
+        try:
+            return resp.json()
+        except json.JSONDecodeError as exc:
+            raise OpensolrError(f"ingest_status: non-JSON response: {resp.text[:200]}") from exc
+
     def embed_and_search(self, index: str, query: str, rows: int = 10, **params: Any) -> Dict[str, Any]:
         """Server-side one-shot: embed the query, run hybrid search, return docs."""
         body = self.ai(
