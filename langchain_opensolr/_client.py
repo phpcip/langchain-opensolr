@@ -264,6 +264,125 @@ class OpensolrClient:
         resp.raise_for_status()
         return resp.json()
 
+    def hybrid_search(
+        self,
+        index: str,
+        query: str,
+        rows: int = 5,
+        mode: str = "union",
+        alpha: float = 0.5,
+        fl: str = "*,score",
+        fq: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Hybrid (BM25 + kNN) search via the native ``{!hybrid}`` parser.
+
+        The query is embedded server-side; lexical and vector scores are
+        fused per document on the Solr side.
+        """
+        clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
+        vector = self.embed(index, query, is_query=True)
+        compact = json.dumps(vector, separators=(",", ":"))
+        params: Dict[str, Any] = {
+            "q": (
+                f"{{!hybrid lexical=$lexicalRaw vector=$vectorQuery "
+                f"mode={mode} alpha={alpha} topN={max(rows, 10)}}}"
+            ),
+            "lexicalRaw": f'{{!edismax qf="title^100 text^1"}}{clean}',
+            "vectorQuery": f"{{!knn f=embeddings topK={max(rows, 10)}}}{compact}",
+            "rows": rows,
+            "fl": fl,
+        }
+        if fq:
+            params["fq"] = fq
+        return self.solr_select(index, params)
+
+    #: RAG context defaults — how many hybrid hits feed the LLM, and how many
+    #: words of each hit's text are included. Both overridable per call.
+    RAG_DOCS = 3
+    RAG_WORDS = 1500
+
+    def _rag_context(
+        self,
+        index: str,
+        query: str,
+        fq: Optional[str] = None,
+        docs: Optional[int] = None,
+        words: Optional[int] = None,
+    ) -> str:
+        """Build the LLM context from the top hybrid search hits."""
+
+        def _flat(v: Any) -> str:
+            if isinstance(v, list):
+                v = " ".join(str(x) for x in v)
+            return str(v or "")
+
+        docs = docs or self.RAG_DOCS
+        words = words or self.RAG_WORDS
+        body = self.hybrid_search(
+            index, query, rows=docs, fl="title,description,text", fq=fq
+        )
+        parts: List[str] = []
+        for doc in body.get("response", {}).get("docs", []):
+            text_words = _flat(doc.get("text")).split()[:words]
+            parts.append(
+                _flat(doc.get("title")) + " - "
+                + _flat(doc.get("description")) + " - "
+                + " ".join(text_words) + " - "
+            )
+        return "".join(parts)
+
+    def ai_summary(
+        self,
+        index: str,
+        query: str,
+        filter_query: Optional[str] = None,
+        rag_docs: Optional[int] = None,
+        rag_words: Optional[int] = None,
+        instruction: Optional[str] = None,
+        **params: Any,
+    ) -> str:
+        """Grounded RAG answer: hybrid retrieval over the index feeds the LLM.
+
+        Retrieval runs client-side via ``hybrid_search`` (same pipeline as the
+        hosted search UI): the top ``rag_docs`` hits' title/description/text
+        (first ``rag_words`` words each) become the LLM context. Pass
+        ``instruction`` to fully control the prompt (e.g. "Answer in German",
+        "Extract a list of people"). If retrieval fails or returns nothing,
+        the server falls back to its own retrieval. Returns plain text.
+        """
+        data = {
+            **self._auth_params(),
+            "index_name": index,
+            "query": query,
+            "stream": "false",
+            **params,
+        }
+        if instruction:
+            data["instruction"] = instruction
+        if "context" not in data:
+            try:
+                context = self._rag_context(
+                    index, query, fq=filter_query, docs=rag_docs, words=rag_words
+                )
+            except (OpensolrError, httpx.HTTPError):
+                context = ""
+            if context:
+                data["context"] = context
+                data.setdefault(
+                    "instruction",
+                    "Read and understand the full context below, and formulate "
+                    f"a clear, concise and factual answer to: '{query}'.\n"
+                    "Answer ONLY from the context. Format the answer in "
+                    "Markdown, use bold section headers where they help, and "
+                    "cite exact titles or names from the context when "
+                    "referring to them.\n",
+                )
+        resp = self._http.post(f"{AI_BASE}/ai_summary", data=data)
+        if resp.status_code >= 400:
+            raise OpensolrError(f"ai_summary: HTTP {resp.status_code}: {resp.text[:200]}")
+        # The stream is prefixed with flush-padding whitespace — strip it.
+        return resp.text.strip()
+
     def solr_update(self, index: str, payload: Any, commit: bool = True) -> Dict[str, Any]:
         base, auth = self.solr_endpoint(index)
         params = {"commit": "true"} if commit else {"commitWithin": "10000"}

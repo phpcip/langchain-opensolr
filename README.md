@@ -131,6 +131,21 @@ entry? Configure the **Web Crawler** in the Control Panel (Index Tools →
 WebCrawler): add your site URL, validate it, and Opensolr indexes the whole
 site for you.
 
+## Grounded RAG answers
+
+One call: hybrid retrieval picks the top hits, whose content becomes the LLM
+context, and Opensolr's server-side LLM answers — the same pipeline that powers
+the AI answers on our hosted search pages. No LLM key, no chain to assemble:
+
+```python
+answer = vs.ai_answer(
+    "what does the refund policy say?",
+    rag_docs=3,        # how many hybrid hits feed the LLM (default 3)
+    rag_words=1500,    # words of text taken from each hit (default 1500)
+    # instruction="Answer in German, cite the exact titles you used",  # optional
+)
+```
+
 ## How it's tested
 
 Every release is validated against **live Opensolr infrastructure** — no mocks:
@@ -149,6 +164,7 @@ Every release is validated against **live Opensolr infrastructure** — no mocks
 - **PDF ingestion**: a real PDF ingested via `rtf:true` — server-side text
   extraction (13k+ chars), automatic content-type detection, then retrieved
   with a purely semantic query against its contents.
+- **Grounded RAG answers**: `ai_answer` verified end-to-end — a question answerable only from the ingested PDF returns the correct answer, sourced from the PDF's extracted text via hybrid retrieval.
 
 ```bash
 pytest tests/unit_tests
