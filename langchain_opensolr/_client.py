@@ -18,13 +18,25 @@ import httpx
 MGMT_BASE = "https://opensolr.com/solr_manager/api"
 AI_BASE = "https://api.opensolr.com/solr_manager/api"
 
-#: Only these Opensolr environments run vector-enabled (Solr 9.x + knn_vector
-#: schema) servers. ``create_index`` for a vector index must target one of them.
+#: Convenience aliases for Opensolr's vector-enabled environments. The
+#: authoritative list is served live by the platform (``vector_regions``
+#: endpoint) — new regions become valid automatically, and additional
+#: dedicated regions can be deployed on request (paid): support@opensolr.com.
 VECTOR_LOCATIONS: Dict[str, str] = {
     "us": "CHICAGO-96",
     "de": "DE-SOLR-9",
     "fi": "FINLAND9",
 }
+
+
+def resolve_location(location: str) -> str:
+    """Map a friendly alias ("us"/"de"/"fi") to its environment identifier.
+
+    Unknown values pass through unchanged — validity is decided against the
+    live ``vector_regions`` list (or, ultimately, by the server), so newly
+    deployed vector regions work without a package upgrade.
+    """
+    return VECTOR_LOCATIONS.get(location.strip().lower(), location.strip())
 
 #: Server-side limit for one batch_embed call.
 BATCH_EMBED_MAX = 50
@@ -96,17 +108,35 @@ class OpensolrClient:
         self._core_info_cache[index] = info
         return info
 
-    def create_index(self, index: str, location: str = "us") -> Dict[str, Any]:
-        """Create a vector-enabled index on one of the vector locations.
+    def vector_regions(self) -> List[Dict[str, str]]:
+        """Live list of vector-enabled environments (Solr 9.x + knn_vector +
+        hybrid parser): ``[{environment, country, solr_version}, ...]``.
 
-        ``location`` is one of :data:`VECTOR_LOCATIONS` keys ("us", "de", "fi")
-        or a raw Opensolr environment identifier.
+        Cached per client. Additional dedicated regions can be deployed on
+        request (paid) — contact support@opensolr.com.
         """
-        env = VECTOR_LOCATIONS.get(location.lower(), location)
-        if env not in VECTOR_LOCATIONS.values():
+        if not hasattr(self, "_vector_regions_cache"):
+            body = self.mgmt("vector_regions")
+            self._vector_regions_cache = body if isinstance(body, list) else []
+        return self._vector_regions_cache
+
+    def create_index(self, index: str, location: str = "us") -> Dict[str, Any]:
+        """Create a vector-enabled index in a vector location.
+
+        ``location`` is an alias ("us", "de", "fi") or a raw Opensolr
+        environment identifier. Validated against the live ``vector_regions``
+        list when reachable; otherwise the server has the final word.
+        """
+        env = resolve_location(location)
+        try:
+            live = {r["environment"] for r in self.vector_regions()}
+        except OpensolrError:
+            live = set(VECTOR_LOCATIONS.values())  # offline fallback
+        if live and env not in live:
             raise ValueError(
-                f"Vector-enabled indexes are only available in these locations: "
-                f"{sorted(VECTOR_LOCATIONS)} (got {location!r})"
+                f"{location!r} is not a vector-enabled Opensolr location. "
+                f"Currently available: {sorted(live)}. Additional regions can "
+                f"be deployed on request — contact support@opensolr.com."
             )
         return self.mgmt(
             "create_index", index_name=index, core_type="generic", server_country=env

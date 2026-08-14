@@ -2,7 +2,7 @@
 
 import pytest
 
-from langchain_opensolr._client import VECTOR_LOCATIONS, OpensolrClient
+from langchain_opensolr._client import VECTOR_LOCATIONS, resolve_location
 from langchain_opensolr.vectorstores import (
     OpensolrVectorStore,
     _escape_fq_value,
@@ -14,19 +14,12 @@ def _store():
     return OpensolrVectorStore(index="t__dense", email="a@b.c", api_key="k")
 
 
-def test_locations():
+def test_location_aliases():
     assert set(VECTOR_LOCATIONS) == {"us", "de", "fi"}
-
-
-def test_invalid_location_rejected():
-    with pytest.raises(ValueError, match="locations"):
-        OpensolrVectorStore(index="t", email="a@b.c", api_key="k", location="jp")
-
-
-def test_create_index_rejects_non_vector_location():
-    client = OpensolrClient("a@b.c", "k")
-    with pytest.raises(ValueError, match="locations"):
-        client.create_index("t__dense", location="XYZ")
+    assert resolve_location("us") == "CHICAGO-96"
+    assert resolve_location("DE") == "DE-SOLR-9"
+    # Unknown values pass through — validated live against vector_regions
+    assert resolve_location("TOKYO-9") == "TOKYO-9"
 
 
 def test_meta_key_sanitization():

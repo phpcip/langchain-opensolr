@@ -84,8 +84,11 @@ emb.embed_query("budget-friendly dining")   # -> 1024 floats
 
 ## Notes
 
-- Vector-enabled indexes run on Opensolr's Solr 9.x environments — locations
+- Vector-enabled indexes run on Opensolr's Solr 9.x environments — currently
   `us` (Chicago), `de` (Germany), `fi` (Finland). Pass `location=` to choose.
+  The list is fetched live from the platform, so new regions work without a
+  package upgrade — and **additional dedicated regions can be deployed on
+  request** (paid add-on): [support@opensolr.com](mailto:support@opensolr.com).
 - A free Opensolr account (15-day trial, no card) includes an AI quota that
   comfortably covers this README end to end:
   [opensolr.com](https://opensolr.com).

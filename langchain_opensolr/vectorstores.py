@@ -29,7 +29,7 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 
-from ._client import VECTOR_LOCATIONS, OpensolrClient, OpensolrError
+from ._client import VECTOR_LOCATIONS, OpensolrClient, OpensolrError, resolve_location
 from .embeddings import OpensolrEmbeddings
 
 _HYBRID_MODES = ("union", "keywords_required", "meaning_required", "intersection")
@@ -110,10 +110,9 @@ class OpensolrVectorStore(VectorStore):
             if not (email and api_key):
                 raise ValueError("Provide either a client or email + api_key")
             client = OpensolrClient(email, api_key)
-        if location.lower() not in VECTOR_LOCATIONS and location not in VECTOR_LOCATIONS.values():
-            raise ValueError(
-                f"Vector-enabled Opensolr locations are {sorted(VECTOR_LOCATIONS)}; got {location!r}"
-            )
+        # No hard validation here: the authoritative location list is fetched
+        # live in create_index (vector_regions endpoint), so newly deployed
+        # vector regions work without upgrading this package.
         self._client = client
         self._index = index
         self._location = location
