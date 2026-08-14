@@ -233,7 +233,20 @@ class OpensolrClient:
             raise OpensolrError(f"ingest_status: non-JSON response: {resp.text[:200]}") from exc
 
     def embed_and_search(self, index: str, query: str, rows: int = 10, **params: Any) -> Dict[str, Any]:
-        """Server-side one-shot: embed the query, run hybrid search, return docs."""
+        """Server-side one-shot: embed the query, run the platform's tuned
+        hybrid search, return ranked docs.
+
+        Retrieval uses the same pipeline as the hosted search UI: global
+        defaults, overridden by the index's saved Search Tuning (Control
+        Panel → Index Settings → Search Tuning), overridden by any of these
+        per-call knobs passed as extra params: ``fw_title``,
+        ``fw_description``, ``fw_uri``, ``fw_text``, ``fw_text_t``,
+        ``lexical_weight``, ``vector_weight``, ``vector_topk``,
+        ``search_mode`` (union / keywords_required / meaning_required /
+        intersection), ``quality_boost``, ``min_score``,
+        ``freshness_boost``, ``lexical_norm_k``, ``mm`` (flexible /
+        balanced / strict or raw Solr mm syntax).
+        """
         body = self.ai(
             "embed_and_search",
             index_name=index,
@@ -308,6 +321,7 @@ class OpensolrClient:
         fq: Optional[str] = None,
         docs: Optional[int] = None,
         words: Optional[int] = None,
+        tuning: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build the LLM context from the top hybrid search hits.
 
@@ -329,7 +343,7 @@ class OpensolrClient:
         hits: List[Dict[str, Any]] = []
         if not fq:
             try:
-                body = self.embed_and_search(index, query, rows=docs)
+                body = self.embed_and_search(index, query, rows=docs, **(tuning or {}))
                 if isinstance(body, dict):
                     hits = body.get("results", {}).get("docs", []) or []
             except (OpensolrError, httpx.HTTPError):
@@ -357,6 +371,7 @@ class OpensolrClient:
         rag_docs: Optional[int] = None,
         rag_words: Optional[int] = None,
         instruction: Optional[str] = None,
+        tuning: Optional[Dict[str, Any]] = None,
         **params: Any,
     ) -> str:
         """Grounded RAG answer: hybrid retrieval over the index feeds the LLM.
@@ -380,7 +395,8 @@ class OpensolrClient:
         if "context" not in data:
             try:
                 context = self._rag_context(
-                    index, query, fq=filter_query, docs=rag_docs, words=rag_words
+                    index, query, fq=filter_query, docs=rag_docs, words=rag_words,
+                    tuning=tuning,
                 )
             except (OpensolrError, httpx.HTTPError):
                 context = ""
