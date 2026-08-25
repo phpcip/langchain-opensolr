@@ -49,20 +49,17 @@ BATCH_EMBED_MAX = 50
 # rules make it lead with the answer and keep the concrete details. Callers
 # can still override everything by passing ``instruction``.
 DEFAULT_RAG_INSTRUCTION = (
-    "Answer the query using only the context below. "
-    "Do not repeat or restate the question, and do not print it as a heading. "
-    "If the question is a yes or no question and the context supports it, begin with \"Yes\". "
-    "For any other question, begin with the fact itself, never with \"Yes\". "
-    "Never begin with \"No\" when the context does support the answer. "
-    "Start with the answer itself: do not open with a preamble about what the context does "
-    "or does not address, and never say the context does not cover the query and then answer "
-    "it anyway. "
-    "Give a substantive answer with the concrete details from the context: who, what, where "
-    "and when. "
-    "Do not dismiss the query on a technicality. If the context covers something closely "
-    "related rather than the exact wording used, explain what it does say and how it relates. "
-    "Only if nothing in the context is relevant at all, say so in one sentence and name what "
-    "the context is about instead."
+    # Consolidated 2026-08-26. The rule list had grown to eight overlapping lines and the
+    # 3B model drowned in them: it restated the question, opened with a preamble, and
+    # presented items as fit for purposes the context never stated. Tested against the
+    # live model on three cases (answer present, answer absent, yes/no) before shipping.
+    "Answer the question using only the context below.\n"
+    "Begin with the answer itself, the specific fact, product or detail. "
+    "No preamble, no restating the question, no heading.\n"
+    "Then give the concrete supporting details from the context: names, numbers, sizes, dates. "
+    "Write two to four sentences.\n"
+    "If the context holds no answer, say that in the first sentence and name what it does contain instead.\n"
+    "Never present something as suitable for a purpose the context does not state."
 )
 
 class OpensolrError(RuntimeError):
