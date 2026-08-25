@@ -42,6 +42,25 @@ def resolve_location(location: str) -> str:
 BATCH_EMBED_MAX = 50
 
 
+# Default RAG instruction (added 2026-08-25).
+# Without an instruction the server falls back to "Answer the query based on
+# the context", which makes the model hedge: it opens with a disclaimer that
+# the context does not cover the question and then answers it anyway. These
+# rules make it lead with the answer and keep the concrete details. Callers
+# can still override everything by passing ``instruction``.
+DEFAULT_RAG_INSTRUCTION = (
+    "Answer the query using only the context below. "
+    "Start with the answer itself: do not open with a preamble about what the context does "
+    "or does not address, and never say the context does not cover the query and then answer "
+    "it anyway. "
+    "Give a substantive answer with the concrete details from the context: who, what, where "
+    "and when. "
+    "Do not dismiss the query on a technicality. If the context covers something closely "
+    "related rather than the exact wording used, explain what it does say and how it relates. "
+    "Only if nothing in the context is relevant at all, say so in one sentence and name what "
+    "the context is about instead."
+)
+
 class OpensolrError(RuntimeError):
     """Raised when an Opensolr API call fails."""
 
@@ -390,8 +409,7 @@ class OpensolrClient:
             "stream": "false",
             **params,
         }
-        if instruction:
-            data["instruction"] = instruction
+        data["instruction"] = instruction or DEFAULT_RAG_INSTRUCTION
         if "context" not in data:
             try:
                 context = self._rag_context(
