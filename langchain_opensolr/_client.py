@@ -50,8 +50,10 @@ BATCH_EMBED_MAX = 50
 # can still override everything by passing ``instruction``.
 DEFAULT_RAG_INSTRUCTION = (
     "Answer the query using only the context below. "
-    "If any part of the context supports the answer, begin with \"Yes\" or with the fact itself. "
-    "Never begin with \"No\" when the context does support it. "
+    "Do not repeat or restate the question, and do not print it as a heading. "
+    "If the question is a yes or no question and the context supports it, begin with \"Yes\". "
+    "For any other question, begin with the fact itself, never with \"Yes\". "
+    "Never begin with \"No\" when the context does support the answer. "
     "Start with the answer itself: do not open with a preamble about what the context does "
     "or does not address, and never say the context does not cover the query and then answer "
     "it anyway. "
