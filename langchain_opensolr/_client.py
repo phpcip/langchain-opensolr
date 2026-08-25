@@ -50,6 +50,8 @@ BATCH_EMBED_MAX = 50
 # can still override everything by passing ``instruction``.
 DEFAULT_RAG_INSTRUCTION = (
     "Answer the query using only the context below. "
+    "If any part of the context supports the answer, begin with \"Yes\" or with the fact itself. "
+    "Never begin with \"No\" when the context does support it. "
     "Start with the answer itself: do not open with a preamble about what the context does "
     "or does not address, and never say the context does not cover the query and then answer "
     "it anyway. "
@@ -372,6 +374,16 @@ class OpensolrClient:
                 index, query, rows=docs, fl="title,description,text", fq=fq
             )
             hits = body.get("response", {}).get("docs", [])
+        # Relevance floor (2026-08-25). Retrieval always returns `docs` hits, so a
+        # narrow question arrives with one good match and several unrelated ones.
+        # The model then sees that most of its context does not answer the query
+        # and hedges. Drop anything scoring below half of the best hit; documents
+        # without a score are kept, since only provable weakness is filtered.
+        scored = [float(h["score"]) for h in hits if isinstance(h, dict) and h.get("score") is not None]
+        if scored:
+            floor = max(scored) * 0.5
+            hits = [h for h in hits if h.get("score") is None or float(h["score"]) >= floor]
+
         parts: List[str] = []
         for doc in hits[:docs]:
             text_words = _flat(doc.get("text")).split()[:words]
