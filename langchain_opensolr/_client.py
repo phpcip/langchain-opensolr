@@ -10,6 +10,7 @@ Direct Solr access (select/update) goes to the index's own host, resolved via
 
 from __future__ import annotations
 
+import re
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -392,11 +393,19 @@ class OpensolrClient:
 
         parts: List[str] = []
         for doc in hits[:docs]:
-            text_words = _flat(doc.get("text")).split()[:words]
+            # Truncate at the Nth word by CUTTING the original string, never by splitting and
+            # re-joining: " ".join(text.split()) throws away every newline and every run of
+            # indentation, so a page arrives as one unbroken line with its paragraphs, lists and
+            # code blocks flattened. Text handed to a model has to reach it as written; the
+            # structure is part of the meaning (2026-08-26).
+            body = _flat(doc.get("text"))
+            matches = list(re.finditer(r"\S+", body))
+            if len(matches) > words:
+                body = body[: matches[words - 1].end()]
             parts.append(
-                _flat(doc.get("title")) + " - "
-                + _flat(doc.get("description")) + " - "
-                + " ".join(text_words) + " - "
+                _flat(doc.get("title")) + "\n"
+                + _flat(doc.get("description")) + "\n"
+                + body + "\n\n"
             )
         return "".join(parts)
 
