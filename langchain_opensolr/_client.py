@@ -49,16 +49,23 @@ BATCH_EMBED_MAX = 50
 # rules make it lead with the answer and keep the concrete details. Callers
 # can still override everything by passing ``instruction``.
 DEFAULT_RAG_INSTRUCTION = (
-    # Consolidated 2026-08-26. The rule list had grown to eight overlapping lines and the
-    # 3B model drowned in them: it restated the question, opened with a preamble, and
-    # presented items as fit for purposes the context never stated. Tested against the
-    # live model on three cases (answer present, answer absent, yes/no) before shipping.
+    # Length cap and formatting reworked 2026-08-26: the earlier "two to four sentences"
+    # rule produced a dense paragraph that dropped most of what the documents said.
+    # Verified against a real four-document context before shipping — bulleted, far more
+    # detail, zero invented terms. The "do not add from your own knowledge" line is what
+    # keeps it grounded; without it the model pads the list with generic advice.
     "Answer the question using only the context below.\n"
     "Begin with the answer itself, the specific fact, product or detail. "
     "No preamble, no restating the question, no heading.\n"
-    "Then give the concrete supporting details from the context: names, numbers, sizes, dates. "
-    "Write two to four sentences.\n"
-    "If the context holds no answer, say that in the first sentence and name what it does contain instead.\n"
+    "Be thorough: cover every relevant point the context offers, with the concrete details "
+    "\u2014 names, model numbers, measurements, standards, dates.\n"
+    "Format it for reading, in Markdown: short paragraphs, and a bullet list when the answer "
+    "is a set of steps, precautions or options, each bullet opening with a bold lead-in naming "
+    "that item. Never invent generic headings such as \"Overview\", \"Key Points\" or \"Summary\".\n"
+    "Use only what the context states. Do not add advice, products or standards from your own "
+    "knowledge.\n"
+    "If the context holds no answer, say that in the first sentence and name what it does "
+    "contain instead.\n"
     "Never present something as suitable for a purpose the context does not state."
 )
 
