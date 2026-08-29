@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import json
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -64,6 +65,16 @@ BATCH_EMBED_MAX = 50
 # everywhere; a caller who turns it on has said they want recent documents to win,
 # so it is applied at full strength with no hedging.
 FRESH_BIAS_FUNCTION = "recip(max(0,ms(NOW,creation_date)),3.16e-11,1,1)"
+
+#: The four candidate-selection modes the {!hybrid} parser understands.
+#:
+#: Validated rather than trusted, because the failure is silent: `mode` is interpolated into
+#: the {!hybrid} local params, and the Solr plugin does not reject a value it does not know —
+#: it falls back to union. So `mode="intersectoin"`, one letter off, returned 18 hits where
+#: intersection returns 2, with no error anywhere (measured 2026-08-29). A caller got nine
+#: times the documents they asked for and no way to notice. The wrapper layers validated this
+#: already; the client, which is the package's public API, did not.
+HYBRID_MODES = ("union", "keywords_required", "meaning_required", "intersection")
 
 
 def apply_fresh_bias(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -426,10 +437,20 @@ class OpensolrClient:
     def _auth_params(self) -> Dict[str, str]:
         return {"email": self.email, "api_key": self.api_key}
 
+    #: How many times a request is retried when the connection dies before a response arrives.
+    #:
+    #: Long-lived keep-alive sockets get dropped by the far end now and then — measured at
+    #: roughly 1 request in 60 against production. Without a retry that surfaces as a raw
+    #: httpx.RemoteProtocolError out of any public method, and the sharpest edge is
+    #: ingest(wait=True): its poll loop would abort a multi-minute wait on one dropped socket,
+    #: even though the ingestion completed fine server-side, leaving the caller with an
+    #: exception and no idea whether their documents landed (2026-08-29).
+    TRANSPORT_RETRIES = 2
+
     def _request(self, base: str, method: str, params: Dict[str, Any]) -> Any:
         url = f"{base}/{method}"
         data = {**self._auth_params(), **params}
-        resp = self._http.post(url, data=data)
+        resp = self._post_with_retry(url=url, data=data, label=method)
         if resp.status_code >= 500:
             raise OpensolrError(f"{method}: HTTP {resp.status_code}: {resp.text[:200]}")
         try:
@@ -439,6 +460,30 @@ class OpensolrClient:
         if isinstance(body, dict) and body.get("status") is False:
             raise OpensolrError(f"{method}: {body.get('msg', body)}")
         return body
+
+    def _post_with_retry(self, *, url: str, label: str, **kwargs: Any) -> "httpx.Response":
+        """POST, retrying only when the connection failed BEFORE a response was produced.
+
+        httpx.TransportError covers exactly that family — connect failures, read timeouts and
+        the server hanging up mid-flight. A request that died there was never answered, so
+        re-sending it cannot duplicate work. Anything that DID come back, including a 4xx or a
+        5xx, is returned untouched: a 500 from the application is a real answer about a real
+        attempt, and retrying it would hammer a struggling server and could repeat a write.
+        """
+        last: Optional[Exception] = None
+        for attempt in range(self.TRANSPORT_RETRIES + 1):
+            try:
+                return self._http.post(url, **kwargs)
+            except httpx.TransportError as exc:
+                last = exc
+                if attempt == self.TRANSPORT_RETRIES:
+                    break
+                # Short, growing pause: a dropped keep-alive reconnects immediately, while a
+                # server briefly refusing connections needs a breath before the next try.
+                time.sleep(0.25 * (attempt + 1))
+        raise OpensolrError(
+            f"{label}: connection failed after {self.TRANSPORT_RETRIES + 1} attempts: {last}"
+        ) from last
 
     def mgmt(self, method: str, **params: Any) -> Any:
         return self._request(MGMT_BASE, method, params)
@@ -496,7 +541,7 @@ class OpensolrClient:
                 f"be deployed on request — contact support@opensolr.com."
             )
         # create_index reads its params from the query string (GET) server-side
-        resp = self._http.post(
+        resp = self._post_with_retry(label="embed", url=
             f"{MGMT_BASE}/create_index",
             params={"index_name": index, "core_type": "generic", "server_country": env},
             data=self._auth_params(),
@@ -523,7 +568,7 @@ class OpensolrClient:
         out: List[List[float]] = []
         for i in range(0, len(texts), BATCH_EMBED_MAX):
             chunk = texts[i : i + BATCH_EMBED_MAX]
-            resp = self._http.post(
+            resp = self._post_with_retry(label="batch_embed", url=
                 f"{AI_BASE}/batch_embed",
                 json={
                     **self._auth_params(),
@@ -552,7 +597,7 @@ class OpensolrClient:
         ``wait=True``, polls ``ingest_status`` until the job completes
         (the queue is processed every minute).
         """
-        resp = self._http.post(
+        resp = self._post_with_retry(label="ingest", url=
             f"{AI_BASE}/ingest",
             json={**self._auth_params(), "core_name": index, "documents": documents},
         )
@@ -580,7 +625,7 @@ class OpensolrClient:
 
     def ingest_status(self, job_id: str) -> Dict[str, Any]:
         """Status of an ingestion job (also visible in the Control Panel)."""
-        resp = self._http.post(
+        resp = self._post_with_retry(label="ingest_status", url=
             f"{AI_BASE}/ingest_status",
             data={**self._auth_params(), "job_id": job_id},
         )
@@ -647,7 +692,7 @@ class OpensolrClient:
 
     def solr_select(self, index: str, params: Dict[str, Any]) -> Dict[str, Any]:
         base, auth = self.solr_endpoint(index)
-        resp = self._http.post(f"{base}/select", data={"wt": "json", **params}, auth=auth)
+        resp = self._post_with_retry(label="solr_select", url=f"{base}/select", data={"wt": "json", **params}, auth=auth)
         resp.raise_for_status()
         return resp.json()
 
@@ -672,13 +717,25 @@ class OpensolrClient:
         rank higher. It re-orders and never filters: numFound is unchanged and a
         document with no date keeps its place. Off by default.
         """
+        # Validate BEFORE embedding. Both checks are purely local, and embedding is a billed
+        # GPU round-trip against the account's AI quota — paying for one to then reject the
+        # caller's own typo is charging them for our own argument check.
+        if mode not in HYBRID_MODES:
+            raise ValueError(f"mode must be one of {HYBRID_MODES}, got {mode!r}")
+        try:
+            alpha_f = float(alpha)
+        except (TypeError, ValueError):
+            raise ValueError(f"alpha must be a number between 0 and 1, got {alpha!r}") from None
+        if not 0.0 <= alpha_f <= 1.0:
+            raise ValueError(f"alpha must be between 0 and 1, got {alpha_f}")
+
         clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
         vector = self.embed(index, query, is_query=True)
         compact = json.dumps(vector, separators=(",", ":"))
         params: Dict[str, Any] = {
             "q": (
                 f"{{!hybrid lexical=$lexicalRaw vector=$vectorQuery "
-                f"mode={mode} alpha={alpha} topN={max(rows, 10)}}}"
+                f"mode={mode} alpha={alpha_f} topN={max(rows, 10)}}}"
             ),
             "lexicalRaw": f'{{!edismax qf="title^100 text^1"}}{clean}',
             "vectorQuery": f"{{!knn f=embeddings topK={max(rows, 10)}}}{compact}",
@@ -786,7 +843,11 @@ class OpensolrClient:
         data = {
             **self._auth_params(),
             "index_name": index,
-            "stream": "false",
+            # "no", not "false": Api_lib::ai_summary() disables streaming on that exact string
+            # and streams for anything else, so "false" was asking for a stream and getting one.
+            # Nothing broke — the body arrives whole and is trimmed — but the parameter did not
+            # do what its value said (2026-08-29).
+            "stream": "no",
             # Every candidate wording was scored at 0.1, so the temperature is part
             # of the prompt, not a taste setting: raising it invalidates the
             # measurement the wording rests on. A caller can still override it
@@ -812,7 +873,7 @@ class OpensolrClient:
             data["instruction"] = prompt
         else:
             data["instruction"] = build_instruction(context, query)
-        resp = self._http.post(f"{AI_BASE}/ai_summary", data=data)
+        resp = self._post_with_retry(label="ai_summary", url=f"{AI_BASE}/ai_summary", data=data)
         if resp.status_code >= 400:
             raise OpensolrError(f"ai_summary: HTTP {resp.status_code}: {resp.text[:200]}")
         # The stream is prefixed with flush-padding whitespace — strip it.
@@ -821,7 +882,7 @@ class OpensolrClient:
     def solr_update(self, index: str, payload: Any, commit: bool = True) -> Dict[str, Any]:
         base, auth = self.solr_endpoint(index)
         params = {"commit": "true"} if commit else {"commitWithin": "10000"}
-        resp = self._http.post(
+        resp = self._post_with_retry(label="solr_update", url=
             f"{base}/update",
             params=params,
             json=payload,

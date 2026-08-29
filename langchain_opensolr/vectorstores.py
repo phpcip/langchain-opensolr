@@ -30,6 +30,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 
 from ._client import (
+    HYBRID_MODES,
     VECTOR_LOCATIONS,
     OpensolrClient,
     OpensolrError,
@@ -38,7 +39,9 @@ from ._client import (
 )
 from .embeddings import OpensolrEmbeddings
 
-_HYBRID_MODES = ("union", "keywords_required", "meaning_required", "intersection")
+# Re-exported from the client so there is ONE list. The client validates before it spends an
+# embedding call; this name is kept because the wrapper's own signatures reference it.
+_HYBRID_MODES = HYBRID_MODES
 
 #: Solr fields managed by this integration or by the Opensolr schema that
 #: should not leak into Document.metadata.
@@ -405,11 +408,15 @@ class OpensolrVectorStore(VectorStore):
                 for d in body["response"]["docs"]
             ]
 
+        # Validate before embedding: the check is local and free, the embedding is a billed GPU
+        # round-trip. Rejecting the caller's typo after paying for it charged them for our own
+        # argument validation (2026-08-29).
+        if hybrid and mode not in _HYBRID_MODES:
+            raise ValueError(f"mode must be one of {_HYBRID_MODES}, got {mode!r}")
+
         vector = self._client.embed(self._index, query, is_query=True)
         knn = self._knn_query(vector, max(k, 10))
         if hybrid:
-            if mode not in _HYBRID_MODES:
-                raise ValueError(f"mode must be one of {_HYBRID_MODES}, got {mode!r}")
             clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
             params["q"] = (
                 f"{{!hybrid lexical=$lexicalRaw vector=$vectorQuery "
