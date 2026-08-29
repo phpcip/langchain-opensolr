@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langchain-opensolr"
-version = "0.2.9"
+version = "0.3.0"
 description = "LangChain integration for Opensolr — managed Apache Solr with server-side embeddings and hybrid (BM25 + kNN) search"
 readme = "README.md"
 license = { text = "MIT" }
