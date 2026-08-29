@@ -42,6 +42,35 @@ print(docs[0].page_content)
 That's it — no embedding model was configured, because embedding happens on
 the server at both index and query time.
 
+## Try it without an account
+
+There is a public demo account. Point the package at it and everything in this
+README works immediately, with no signup:
+
+```bash
+export OPENSOLR_EMAIL=mcp@opensolr.com
+export OPENSOLR_API_KEY=420b8b23e7b12dc8ab838932145a5065
+```
+
+`mcp_demo_d1__dense` is already loaded with 300 news articles, so search, filtering
+and grounded answers work the moment you connect. You also get the full write path:
+create your own index on the account, ingest into it, query it, delete it.
+
+Know what you are working with:
+
+- **Anything you create there is deleted after 3 days.** Automatically, without warning
+  or export. That includes indexes you created and every document in them.
+- **The account is shared with everyone reading this.** Your index is visible to them,
+  they can change or delete it, and you can do the same to theirs. Never put anything
+  real, private or client-owned in it.
+- **The limits are per index, and deliberately small.** 200 MB of bandwidth and 50 MB
+  of disk per index. Bandwidth is the one you will hit first: it covers a demo, a
+  tutorial and a proof of concept, and it will not carry an application.
+
+When you want an index that is private, yours and still there next week, get your own
+key — [free 15-day trial, no card](https://opensolr.com/register) — and change the two
+variables above. Nothing else in your code changes.
+
 ## Hybrid search
 
 Pure vector search fails on exact identifiers; pure BM25 fails on meaning.

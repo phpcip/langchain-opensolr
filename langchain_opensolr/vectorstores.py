@@ -134,6 +134,14 @@ class OpensolrVectorStore(VectorStore):
             vs.add_texts(["Solr is a search platform", "Cats sleep a lot"])
             docs = vs.similarity_search("search engines", k=2)
 
+            # or run it as-is against the public demo account (see Note below)
+            demo = OpensolrVectorStore(
+                index="mcp_demo_d1__dense",
+                email="mcp@opensolr.com",
+                api_key="420b8b23e7b12dc8ab838932145a5065",
+            )
+            docs = demo.similarity_search("interest rate decision", k=3)
+
             # hybrid BM25 + kNN with filters
             docs = vs.similarity_search(
                 "search engines", k=2, hybrid=True, filter={"category": "docs"}
@@ -152,6 +160,14 @@ class OpensolrVectorStore(VectorStore):
         create_if_missing: Create the index automatically on first use.
         text_field: Solr field holding page content (default ``text``).
         vector_field: Solr ``knn_vector`` field (default ``embeddings``).
+
+    Note:
+        The demo account above is shared publicly — its preloaded
+        ``mcp_demo_d1__dense`` index holds 300 news articles, other people can
+        change or delete what you create, anything created there is deleted after
+        3 days, automatically, and limits are per index and small on purpose:
+        200 MB bandwidth, 50 MB disk. For a private index that persists:
+        https://opensolr.com/register (free 15-day trial, no card).
     """
 
     def __init__(
