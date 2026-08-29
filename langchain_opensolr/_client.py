@@ -66,6 +66,41 @@ BATCH_EMBED_MAX = 50
 # so it is applied at full strength with no hedging.
 FRESH_BIAS_FUNCTION = "recip(max(0,ms(NOW,creation_date)),3.16e-11,1,1)"
 
+#: Default Fresh Results Bias strength when a caller does not pass one.
+FRESH_BIAS_WEIGHT_DEFAULT = 0.5
+
+
+def fresh_bias_function(weight: Optional[float] = None) -> str:
+    """Build the recency function for a 0.0-1.0 ``weight``.
+
+    Mirrors ``Hybrid_search::fresh_bias_function()`` on opensolr.com, the Drupal module and
+    the WordPress plugin. ``recip(ms, c, 1, 1)`` halves at ``ms = 1/c``, so the weight is a
+    HALF-LIFE on a geometric scale between 365 days at 0.0 and 6 hours at 1.0:
+
+    ==========  ===========================================================
+    weight      meaning
+    ==========  ===========================================================
+    0.0         365-day half-life: technically on, barely visible
+    0.3         41 days
+    0.5         9.6 days (the default)
+    0.7         2.2 days
+    1.0         6 hours: date all but replaces relevance
+    ==========  ===========================================================
+
+    The fixed constant this replaces behaved like 0.0, which is why Fresh looked broken on a
+    news index: a 10-day-old article kept 97% of its multiplier, nowhere near enough to
+    outrank a better-matching older one.
+    """
+    w = FRESH_BIAS_WEIGHT_DEFAULT if weight is None else float(weight)
+    w = max(0.0, min(1.0, w))
+    half_life_days = 365.0 * (0.25 / 365.0) ** w
+    # PHP's %g writes "1.212e-9" where Python's writes "1.212e-09". Numerically identical,
+    # textually not — and this string is compared byte for byte against the platform, the
+    # Drupal module and the WordPress plugin by the prompt/query parity harness. Strip the
+    # padding zero so all five implementations emit the same characters.
+    c = ("%.4g" % (1.0 / (half_life_days * 86400000.0))).replace("e-0", "e-").replace("e+0", "e+")
+    return "recip(max(0,ms(NOW,creation_date))," + c + ",1,1)"
+
 #: The four candidate-selection modes the {!hybrid} parser understands.
 #:
 #: Validated rather than trusted, because the failure is silent: `mode` is interpolated into
@@ -77,7 +112,7 @@ FRESH_BIAS_FUNCTION = "recip(max(0,ms(NOW,creation_date)),3.16e-11,1,1)"
 HYBRID_MODES = ("union", "keywords_required", "meaning_required", "intersection")
 
 
-def apply_fresh_bias(params: Dict[str, Any]) -> Dict[str, Any]:
+def apply_fresh_bias(params: Dict[str, Any], weight: Optional[float] = None) -> Dict[str, Any]:
     """Wrap an already-built ``params["q"]`` so the recency curve multiplies the
     FINAL score. Mutates ``params`` in place and returns it.
 
@@ -99,7 +134,21 @@ def apply_fresh_bias(params: Dict[str, Any]) -> Dict[str, Any]:
     rather than being inlined, so a ``}`` in the user's text cannot close the
     ``{!boost}`` block and leave the remainder to be parsed as query syntax.
     """
-    params["freshBias"] = FRESH_BIAS_FUNCTION
+    # A document with no creation_date evaluates recip() at its MAXIMUM, 1.0 — Solr's
+    # ms(NOW, <missing>) is 0 — so an undated document is scored as if published this
+    # instant and floats to the top of a "newest first" ranking. Require a date instead
+    # of silently promoting the ones that have none.
+    fq = params.get("fq")
+    date_fq = "+creation_date:[* TO *]"
+    if fq is None:
+        params["fq"] = date_fq
+    elif isinstance(fq, list):
+        if date_fq not in fq:
+            params["fq"] = fq + [date_fq]
+    elif fq != date_fq:
+        params["fq"] = [fq, date_fq]
+
+    params["freshBias"] = fresh_bias_function(weight)
     params["freshBiasInner"] = params["q"]
     params["q"] = "{!boost b=$freshBias v=$freshBiasInner}"
     return params
@@ -706,6 +755,7 @@ class OpensolrClient:
         fl: str = "*,score",
         fq: Optional[str] = None,
         fresh_bias: bool = False,
+        fresh_bias_weight: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Hybrid (BM25 + kNN) search via the native ``{!hybrid}`` parser.
 
@@ -745,7 +795,7 @@ class OpensolrClient:
         if fq:
             params["fq"] = fq
         if fresh_bias:
-            apply_fresh_bias(params)
+            apply_fresh_bias(params, fresh_bias_weight)
         return self.solr_select(index, params)
 
     #: RAG context defaults — how many hybrid hits feed the LLM, and how many
