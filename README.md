@@ -167,6 +167,33 @@ tuning={"search_mode": "keywords_required", "fw_title": 0.2,
 Defaults match the platform's PHP configuration exactly — customize in the
 Control Panel once, or per call from code.
 
+#### Fresh Results Bias
+
+Rank newer documents higher without hiding anything older. Every score is
+multiplied by a recency curve on `creation_date` — full weight for a document
+published today, about half after a year:
+
+```python
+store.similarity_search_with_score("solar inverter warranty", fresh_bias=True)
+client.hybrid_search(index, query, fresh_bias=True)
+client.ai_answer(index, question, tuning={"fresh_bias": 1})
+```
+
+It **re-orders and never filters**: the hit count is identical either way,
+nothing old becomes unreachable, and a document with no `creation_date` simply
+keeps its place instead of being pushed to the bottom. It applies to all three
+retrieval shapes — vector-only, keyword-only and the fused hybrid ranking —
+because the boost wraps the final score rather than one half of it. Off by
+default.
+
+This is the same control visitors get as the **Fresh** toggle beside the sort
+options on the hosted Opensolr search page, so a query behaves identically here
+and there.
+
+> `fresh_bias` and `freshness_boost` are two different knobs and the names
+> invite confusion. `freshness_boost` is a hard window in **days** — anything
+> older is filtered out and the hit count drops. `fresh_bias` filters nothing.
+
 ## How it's tested
 
 Every release is validated against **live Opensolr infrastructure** — no mocks:
