@@ -158,7 +158,9 @@ ones and older Solr versions.
 ## Your index schema
 
 Documents follow the Opensolr document model (`title`, `description`, `text`,
-`meta_*` custom fields). To see the full schema: **Control Panel → click your
+`meta_*` custom fields). The whole schema, every field and every type suffix,
+is explained in the [Index Schema Reference](https://opensolr.com/opensolr-platform-user-documentation/schema-reference).
+To see your own copy: **Control Panel → click your
 index → Configuration → Edit File → schema.xml**. Prefer zero-effort data
 entry? Configure the **Web Crawler** in the Control Panel (Index Tools →
 WebCrawler): add your site URL, validate it, and Opensolr indexes the whole
