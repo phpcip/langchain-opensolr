@@ -20,10 +20,12 @@ Highlights:
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import base64
 import re
 import time
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -475,6 +477,104 @@ class OpensolrVectorStore(VectorStore):
                 query, k=k, filter=filter, **kwargs
             )
         ]
+
+    def image_to_words(
+        self,
+        image: Union[str, "Path", bytes],
+        top_k: int = 8,
+    ) -> Dict[str, Any]:
+        """Read an image and return what it was turned into, WITHOUT searching yet.
+
+        The picture is sent to the Opensolr image_to_text API and read three ways.
+        Returns a dict so the caller can choose what to search with:
+
+        * ``text``   — the best words to search with (OCR text when the picture is
+          mostly text, otherwise the top visual labels)
+        * ``mode``   — ``"clip"`` (visual) or ``"ocr"`` (text was read off it)
+        * ``labels`` — the CLIP visual labels (what the picture depicts), present
+          even in OCR mode
+        * ``codes``  — any barcodes / QR codes read off the picture
+
+        Args:
+            image: A file path (str/Path) or the raw image bytes.
+            top_k: How many visual labels to request.
+        """
+        raw = bytes(image) if isinstance(image, (bytes, bytearray)) else Path(image).read_bytes()
+        b64 = base64.b64encode(raw).decode("ascii")
+        ans = self._client.image_to_text(self._index, b64, top_k=top_k)
+        labels = [
+            l["label"] for l in (ans.get("labels") or [])
+            if isinstance(l, dict) and l.get("label")
+        ]
+        codes: List[str] = []
+        for c in (ans.get("codes") or []):
+            text = c.get("text") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+            if text:
+                codes.append(text)
+        return {
+            "text": (ans.get("text") or "").strip(),
+            "mode": ans.get("mode") or "clip",
+            "labels": labels,
+            "codes": codes,
+        }
+
+    def search_by_image(
+        self,
+        image: Union[str, "Path", bytes],
+        k: int = 4,
+        using: str = "auto",
+        filter: Optional[Any] = None,
+        top_k: int = 8,
+        **search_kwargs: Any,
+    ) -> List[Document]:
+        """Search the index with a photo instead of a text query.
+
+        The image is turned into words by :meth:`image_to_words`, then those words
+        run through the normal :meth:`similarity_search`, so every search option —
+        ``hybrid``, ``lexical``, ``mode``, ``alpha``, ``fresh_bias`` — applies via
+        ``search_kwargs``. No image vector is stored; the picture simply becomes words.
+
+        Args:
+            image: A file path (str/Path) or the raw image bytes.
+            k: Number of documents to return.
+            using: Which reading of the image to search with —
+                ``"auto"`` (the API's chosen text: OCR text, else visual labels),
+                ``"meaning"`` (the CLIP visual labels — what the picture depicts),
+                ``"text"`` (only the OCR text read off it, empty if none), or
+                ``"code"`` (the first barcode / QR code, matched as an exact keyword), or
+                ``"all"`` (visual labels + OCR text + barcodes combined).
+            filter: Metadata filter, same shapes as :meth:`similarity_search`.
+            top_k: How many visual labels to request from the image API.
+            search_kwargs: Forwarded to :meth:`similarity_search`.
+
+        Returns:
+            The matching documents (empty list if the image yielded no usable words).
+        """
+        read = self.image_to_words(image, top_k=top_k)
+        if using == "meaning":
+            query = ", ".join(read["labels"])
+        elif using == "text":
+            query = read["text"] if read["mode"] == "ocr" else ""
+        elif using == "code":
+            query = read["codes"][0] if read["codes"] else ""
+            # A barcode is an exact token — force pure keyword search, no embedding.
+            search_kwargs.setdefault("lexical", True)
+        elif using == "all":
+            # Everything the picture yielded: visual labels + OCR text + barcodes.
+            parts = list(read["labels"])
+            if read["mode"] == "ocr" and read["text"]:
+                parts.append(read["text"])
+            parts.extend(read["codes"])
+            query = ", ".join(p for p in parts if p)
+        elif using == "auto":
+            query = read["text"]
+        else:
+            raise ValueError(
+                "using must be one of 'auto', 'meaning', 'text', 'code', 'all', got %r" % using
+            )
+        if not query:
+            return []
+        return self.similarity_search(query, k=k, filter=filter, **search_kwargs)
 
     def ai_answer(
         self,

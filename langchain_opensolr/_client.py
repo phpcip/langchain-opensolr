@@ -604,6 +604,17 @@ class OpensolrClient:
     # AI                                                                 #
     # ------------------------------------------------------------------ #
 
+    def image_to_text(self, index: str, image_b64: str, top_k: int = 8) -> Dict[str, Any]:
+        """Turn an image into search words via the Opensolr image_to_text API.
+
+        The image is read three ways server-side and the answer carries all of them:
+        ``text`` (the words to search with — OCR text when the picture is mostly text,
+        otherwise the top visual labels), ``mode`` ("clip" or "ocr"), ``labels`` (the
+        CLIP visual labels, present even in OCR mode), and ``codes`` (barcodes / QR codes).
+        No image vector is stored: the picture simply becomes words the normal search runs.
+        """
+        return self.ai("image_to_text", index_name=index, image=image_b64, top_k=top_k)
+
     def embed(self, index: str, text: str, is_query: bool = False) -> List[float]:
         body = self.ai(
             "embed", index_name=index, payload=text, is_query="1" if is_query else "0"

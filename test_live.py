@@ -707,6 +707,29 @@ def phase_read(client: OpensolrClient) -> None:
 
     check("similarity_search(lexical=True) does keyword-only search", t_lexical_shape)
 
+    _IMG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_image.jpg")
+
+    def t_image_to_words() -> str:
+        read = demo_store.image_to_words(_IMG)
+        require(isinstance(read, dict), f"expected dict, got {type(read).__name__}")
+        require(isinstance(read.get("text"), str) and read["text"].strip(),
+                f"image yielded no words: {read!r}")
+        require(read.get("mode") in ("clip", "ocr"), f"bad mode: {read.get('mode')!r}")
+        require(isinstance(read.get("labels"), list), "labels must be a list")
+        require(isinstance(read.get("codes"), list), "codes must be a list")
+        return f"read as {read['mode']}: {read['text'][:40]!r}, {len(read['labels'])} labels"
+
+    check("image_to_words turns a photo into text / labels / codes", t_image_to_words)
+
+    def t_search_by_image() -> str:
+        docs = demo_store.search_by_image(_IMG, k=3)
+        require(isinstance(docs, list), f"expected list, got {type(docs).__name__}")
+        for d in docs:
+            require(isinstance(d, Document), f"non-Document in results: {type(d).__name__}")
+        return f"{len(docs)} document(s) from the picture"
+
+    check("search_by_image searches the index with a photo", t_search_by_image)
+
     def t_by_vector() -> str:
         vector = STATE.get("query_vector")
         require(vector, "no query vector available from the embed check")
