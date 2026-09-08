@@ -169,7 +169,7 @@ class OpensolrVectorStore(VectorStore):
         change or delete what you create, anything created there is deleted after
         3 days, automatically, and limits are per index and small on purpose:
         200 MB bandwidth, 50 MB disk. For a private index that persists:
-        https://opensolr.com/register (free 15-day trial, no card).
+        https://opensolr.com/register (free forever, no card).
     """
 
     def __init__(

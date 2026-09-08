@@ -7,7 +7,7 @@ with **server-side embeddings** and native **hybrid (BM25 + kNN) search**.
 
 **Product page:** [opensolr.com/langchain](https://opensolr.com/langchain) ·
 **Platform:** [opensolr.com](https://opensolr.com) (managed Solr hosting since 2011 —
-free 15-day trial, no card)
+free forever, no card)
 
 No local embedding model. No third-party embedding API key. One set of
 credentials, and the vectors are computed on Opensolr's GPU infrastructure
@@ -68,7 +68,7 @@ Know what you are working with:
   tutorial and a proof of concept, and it will not carry an application.
 
 When you want an index that is private, yours and still there next week, get your own
-key — [free 15-day trial, no card](https://opensolr.com/register) — and change the two
+key — [free forever, no card](https://opensolr.com/register) — and change the two
 variables above. Nothing else in your code changes.
 
 ## Hybrid search
@@ -120,7 +120,7 @@ emb.embed_query("budget-friendly dining")   # -> 1024 floats
   The list is fetched live from the platform, so new regions work without a
   package upgrade — and **additional dedicated regions can be deployed on
   request** (paid add-on): [support@opensolr.com](mailto:support@opensolr.com).
-- A free Opensolr account (15-day trial, no card) includes an AI quota that
+- A free Opensolr account (free forever, no card) includes an AI quota that
   comfortably covers this README end to end:
   [opensolr.com](https://opensolr.com).
 - Full platform docs: [AI & Vector Search](https://opensolr.com/opensolr-platform-user-documentation/ai-vector).
