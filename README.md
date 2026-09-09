@@ -86,6 +86,34 @@ docs = vs.similarity_search(
 )
 ```
 
+## Search operators
+
+The query string understands the operators people already expect from a search box. They work
+in every mode — keyword, hybrid and pure vector.
+
+| Operator | Meaning | Example |
+| --- | --- | --- |
+| `"word1 word2"` | Phrase — those words together, in that order | `"machine learning"` |
+| `+word` | Required — every result must contain it | `+laptop 15 inch gaming` |
+| `+"word1 word2"` | Required phrase | `+"13 inch"` |
+| `-word` | Excluded — drop any document containing it | `laptop -refurbished` |
+| `-"word1 word2"` | Excluded phrase | `-"open box"` |
+
+They compose: `+laptop +"13 inch" -refurbished` returns only 13-inch laptops and never a
+refurbished one.
+
+A prefixed term (`+` or `-`, word or phrase) becomes a **filter**, applied to the whole result
+set. That matters as soon as a vector is involved: the semantic side of a hybrid search has no
+concept of negation, so left as query text `-refurbished` would actually pull refurbished
+listings *towards* the top rather than removing them. As a filter it binds every document,
+whichever side of the search found it, and the exclusion is absolute.
+
+An unprefixed phrase (`"machine learning"` with no `+` in front) is a keyword-side relevance
+signal rather than a filter — use `+"machine learning"` when you need it enforced.
+
+`+` and `-` only count at the start of a word, so `e-mail`, `covid-19` and `1+1` are searched
+for literally.
+
 ## Metadata filters
 
 ```python

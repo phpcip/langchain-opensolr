@@ -112,6 +112,147 @@ def fresh_bias_function(weight: Optional[float] = None) -> str:
 HYBRID_MODES = ("union", "keywords_required", "meaning_required", "intersection")
 
 
+#: Fields a search-operator filter is evaluated against.
+#:
+#: The same five the platform searches, and deliberately WITHOUT their qf boosts: a filter
+#: does not score, it only cuts. The field list matters because "-word" has to mean the same
+#: thing the caller expects — "drop any document containing that word" — rather than "drop it
+#: only if the word is in the title".
+SEARCH_OPERATOR_FIELDS = "title description uri text text_t"
+
+
+def parse_operators(raw: str) -> Dict[str, Any]:
+    """Split a query into its plain text and its ``+``/``-`` search operators.
+
+    WHY (2026-09-09). ``+word`` and ``-word`` are ordinary edismax syntax, so on a pure
+    keyword search they have always worked. The moment a vector leg runs beside the keyword
+    one they stop meaning anything: the vector leg has never heard of them, so in ``union``
+    mode every document the keyword leg just excluded comes straight back in through it. And
+    exclusion fails twice over, because the raw text — minus sign included — is what gets
+    embedded, and a bi-encoder has no concept of negation: ``-Ruben`` reads as one more word
+    of the question and pulls the results TOWARDS Ruben. Measured on a live news index, the
+    query "did juventus win that match? -Ruben" returned a Ruben article at rank 1.
+
+    So the operators stop being query syntax and become filters — see
+    :func:`apply_search_operators` — which bind every document regardless of which leg found
+    it. This function is only the split.
+
+    Rules:
+      * ``+``/``-`` count as operators only at the start of a token, so ``e-mail``,
+        ``covid-19`` and ``1+1`` are left alone.
+      * The operand is a bare word or a ``"quoted phrase"``; a phrase keeps its quotes,
+        because edismax needs them to build a phrase query.
+      * An unprefixed ``"quoted phrase"`` stays in the base text — it is a relevance signal
+        for the keyword leg, not a filter.
+      * A lone ``+`` or ``-`` with nothing usable after it is plain text.
+
+    Returns a dict with ``base``, ``required``, ``excluded`` and ``has_ops``.
+    """
+    base: List[str] = []
+    required: List[str] = []
+    excluded: List[str] = []
+    s = raw or ""
+    i, n = 0, len(s)
+
+    while i < n:
+        c = s[i]
+
+        if c.isspace():
+            base.append(c)
+            i += 1
+            continue
+
+        # Consume an unprefixed phrase whole, before the operator test below can mistake a
+        # '-' INSIDE it ("foo -bar") for an exclusion.
+        if c == '"':
+            end = s.find('"', i + 1)
+            if end == -1:
+                base.append(s[i:])
+                break
+            base.append(s[i:end + 1])
+            i = end + 1
+            continue
+
+        if c in "+-" and (i == 0 or s[i - 1].isspace()):
+            j = i + 1
+            term = None
+            nxt = j
+            if j < n and s[j] == '"':
+                end = s.find('"', j + 1)
+                if end != -1:
+                    term = s[j:end + 1]
+                    nxt = end + 1
+            if term is None:
+                k = j
+                while k < n and not s[k].isspace():
+                    k += 1
+                term = s[j:k]
+                nxt = k
+            if term.strip().strip('"'):
+                (required if c == "+" else excluded).append(term)
+                i = nxt
+                continue
+            # Empty operand ('+', '-', '+""'): the sign is just a character. Re-scan from
+            # i+1 so the quote branch above can pick up the '""' properly.
+            base.append(c)
+            i += 1
+            continue
+
+        base.append(c)
+        i += 1
+
+    return {
+        "base": " ".join("".join(base).split()),
+        "required": required,
+        "excluded": excluded,
+        "has_ops": bool(required or excluded),
+    }
+
+
+def apply_search_operators(
+    params: Dict[str, Any],
+    parsed: Dict[str, Any],
+    fields: str = SEARCH_OPERATOR_FIELDS,
+) -> Dict[str, Any]:
+    """Turn the operators from :func:`parse_operators` into ``fq`` entries.
+
+    Mutates ``params`` in place and returns it.
+
+    An ``fq`` is evaluated against the whole result set, so it binds a document no matter
+    which leg surfaced it — which is the entire point. The Opensolr ``{!hybrid}`` parser
+    cooperates for free: it runs both sub-queries with the request's filters, and for the
+    vector leg it injects each one as a kNN ``preFilter``, so the HNSW graph is walked
+    already restricted to matching documents. No candidates are spent on documents a filter
+    is about to drop, and ``topN`` keeps its full depth.
+
+    Each operand is bound BY REFERENCE (``v=$reqQ0`` / ``v=$negQ0``) rather than inlined, so
+    a ``}`` or a ``{!`` in the caller's text stays text and can never become a local-param
+    block — verified against live Solr: an operand of ``{!join fromIndex=other}x`` filtered
+    nothing and read nothing. ``mm="100%"`` makes every clause of a multi-word operand
+    mandatory.
+    """
+    fq = params.get("fq")
+    if fq is None:
+        fq = []
+    elif not isinstance(fq, list):
+        fq = [fq]
+
+    for i, term in enumerate(parsed.get("required") or []):
+        key = "reqQ%d" % i
+        params[key] = term
+        fq.append('{!edismax qf="%s" mm="100%%" v=$%s}' % (fields, key))
+
+    for i, term in enumerate(parsed.get("excluded") or []):
+        key = "negQ%d" % i
+        params[key] = term
+        fq.append('-{!edismax qf="%s" mm="100%%" v=$%s}' % (fields, key))
+
+    if fq:
+        params["fq"] = fq
+
+    return params
+
+
 def apply_fresh_bias(params: Dict[str, Any], weight: Optional[float] = None) -> Dict[str, Any]:
     """Wrap an already-built ``params["q"]`` so the recency curve multiplies the
     FINAL score. Mutates ``params`` in place and returns it.

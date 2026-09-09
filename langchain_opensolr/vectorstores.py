@@ -37,6 +37,8 @@ from ._client import (
     OpensolrClient,
     OpensolrError,
     apply_fresh_bias,
+    apply_search_operators,
+    parse_operators,
     resolve_location,
 )
 from .embeddings import OpensolrEmbeddings
@@ -409,9 +411,25 @@ class OpensolrVectorStore(VectorStore):
             "rows": k,
             "fl": "*,score",
         }
-        if lexical:
-            clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
-            params["q"] = f'{{!edismax qf="title^100 description^20 {self._text_field}^1"}}{clean}'
+        # Search operators (+word, -word, +"phrase", -"phrase") are pulled out of the text
+        # here, once, for every shape below. See parse_operators() for why they cannot stay
+        # inside the query on any path that involves a vector.
+        ops = parse_operators(query)
+        # With the operators removed there may be nothing left to search for ("-Ruben" on its
+        # own). Then the operators ARE the query: hand the whole thing to edismax, which
+        # understands them natively, and emit no filters.
+        ops_only = ops["has_ops"] and len(ops["base"]) < 2
+        lexical_text = query if (not ops["has_ops"] or ops_only) else ops["base"]
+
+        if lexical or ops_only:
+            # Bound by reference rather than inlined (2026-09-09). Inlining meant a '}' in the
+            # caller's text closed the {!edismax ...} block and the rest was parsed as query
+            # syntax, which is why braces AND quotes used to be stripped first — and stripping
+            # the quotes silently broke every phrase query this package documents.
+            params["uq"] = lexical_text
+            params["q"] = (
+                f'{{!edismax qf="title^100 description^20 {self._text_field}^1" v=$uq}}'
+            )
             # Fresh Results Bias on the lexical path. Wrapped rather than set as an
             # edismax `bf`: edismax is invoked here through local params inside q, not
             # as the request's defType, so a top-level bf is not reliably its own.
@@ -432,20 +450,28 @@ class OpensolrVectorStore(VectorStore):
         if hybrid and mode not in _HYBRID_MODES:
             raise ValueError(f"mode must be one of {_HYBRID_MODES}, got {mode!r}")
 
-        vector = self._client.embed(self._index, query, is_query=True)
+        # The embedder must never see an operator: it has no concept of negation, so a '-'
+        # term reads as one more word of the question and moves the results towards exactly
+        # what the caller asked to remove.
+        vector = self._client.embed(
+            self._index, ops["base"] if ops["has_ops"] else query, is_query=True
+        )
         knn = self._knn_query(vector, max(k, 10))
         if hybrid:
-            clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
+            params["uq"] = lexical_text
             params["q"] = (
                 f"{{!hybrid lexical=$lexicalRaw vector=$vectorQuery "
                 f"mode={mode} alpha={alpha} topN={max(k, 10)}}}"
             )
             params["lexicalRaw"] = (
-                f'{{!edismax qf="title^100 {self._text_field}^1"}}{clean}'
+                f'{{!edismax qf="title^100 {self._text_field}^1" v=$uq}}'
             )
             params["vectorQuery"] = knn
         else:
             params["q"] = knn
+        # Operators become filters on BOTH vector-bearing shapes. On the pure-kNN shape this
+        # is the only thing that can honour them at all — there is no edismax in that query.
+        apply_search_operators(params, ops)
 
         # Fresh Results Bias wraps whichever shape was just built — fused {!hybrid}
         # or bare {!knn} — so the recency multiplier reaches every candidate,
