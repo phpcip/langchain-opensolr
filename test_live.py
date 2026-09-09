@@ -33,6 +33,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 import uuid
@@ -56,10 +57,13 @@ from langchain_opensolr._client import (
     DEFAULT_RAG_WORDS,
     DOC_FENCE,
     FRESH_BIAS_FUNCTION,
+    SEARCH_OPERATOR_FIELDS,
     VECTOR_LOCATIONS,
     apply_fresh_bias,
+    apply_search_operators,
     build_context,
     build_instruction,
+    parse_operators,
     resolve_location,
 )
 
@@ -322,6 +326,58 @@ def phase_pure() -> None:
         require(resolve_location("FINLAND9") == "FINLAND9", "raw environment ids pass through")
         require(set(VECTOR_LOCATIONS) == {"us", "de", "fi"}, "alias table changed unexpectedly")
         return "us/de/fi -> CHICAGO-96/DE-SOLR-9/FINLAND9, unknown values pass through"
+
+    def t_parse_operators() -> str:
+        cases = {
+            "did juventus win that match? -Ruben":
+                ("did juventus win that match?", [], ["Ruben"]),
+            '+laptop +"13 inch" -refurbished':
+                ("", ["laptop", '"13 inch"'], ["refurbished"]),
+            'laptop -"open box" gaming':
+                ("laptop gaming", [], ['"open box"']),
+            # a '-' mid-token is part of the word, not an operator
+            "e-mail covid-19 1+1 formula":
+                ("e-mail covid-19 1+1 formula", [], []),
+            # a '-' INSIDE a quoted phrase belongs to the phrase
+            '"foo -bar" baz':
+                ('"foo -bar" baz', [], []),
+            # a lone sign, or an empty operand, is plain text
+            'cafea + - fara +"" zahar':
+                ('cafea + - fara +"" zahar', [], []),
+        }
+        for raw, (base, req, exc) in cases.items():
+            got = parse_operators(raw)
+            require(got["base"] == base,
+                    f"{raw!r}: base {got['base']!r} != {base!r}")
+            require(got["required"] == req,
+                    f"{raw!r}: required {got['required']!r} != {req!r}")
+            require(got["excluded"] == exc,
+                    f"{raw!r}: excluded {got['excluded']!r} != {exc!r}")
+            require(got["has_ops"] == bool(req or exc),
+                    f"{raw!r}: has_ops {got['has_ops']!r} is wrong")
+        return f"{len(cases)} queries split exactly, hyphenated words and quoted '-' left alone"
+
+    check("parse_operators splits +/- operators and leaves ordinary text alone", t_parse_operators)
+
+    def t_apply_search_operators() -> str:
+        params: Dict[str, Any] = {"q": "{!hybrid}", "fq": ["meta_kind:news"]}
+        parsed = parse_operators('news +"press release" -rumour')
+        out = apply_search_operators(params, parsed)
+        require(out is params, "apply_search_operators must mutate and return the same dict")
+        require(params["reqQ0"] == '"press release"',
+                f"required operand bound wrong: {params.get('reqQ0')!r}")
+        require(params["negQ0"] == "rumour",
+                f"excluded operand bound wrong: {params.get('negQ0')!r}")
+        want_req = '{!edismax qf="%s" mm="100%%" v=$reqQ0}' % SEARCH_OPERATOR_FIELDS
+        want_neg = '-{!edismax qf="%s" mm="100%%" v=$negQ0}' % SEARCH_OPERATOR_FIELDS
+        require(want_req in params["fq"], f"missing required filter, fq={params['fq']!r}")
+        require(want_neg in params["fq"], f"missing excluded filter, fq={params['fq']!r}")
+        require("meta_kind:news" in params["fq"],
+                "a pre-existing fq must survive, not be overwritten")
+        require(params["q"] == "{!hybrid}", "q must be untouched")
+        return "operands bound by reference, both filters added, existing fq kept"
+
+    check("apply_search_operators emits fq filters and keeps existing ones", t_apply_search_operators)
 
     check("resolve_location maps aliases to environments", t_resolve_location)
 
@@ -748,6 +804,99 @@ def phase_read(client: OpensolrClient) -> None:
             require("mode must be one of" in str(exc), f"unexpected message: {exc}")
             return "an unknown hybrid mode raises ValueError"
         raise AssertionError("an unknown hybrid mode must raise ValueError")
+
+    def _operator_fixture() -> Dict[str, Any]:
+        """Pick a real word and a real two-word phrase out of the top hybrid hit.
+
+        The demo index is not ours to hardcode assumptions about, so the term to exclude is
+        taken from the corpus itself: whatever the top document actually says. Excluding it
+        MUST drop that document; requiring it must keep it.
+        """
+        if "ops_fixture" in STATE:
+            return STATE["ops_fixture"]
+        top = demo_store.similarity_search(QUERY, k=1, hybrid=True)
+        require(top, "the baseline hybrid search returned nothing to build a fixture from")
+        doc = top[0]
+        words = re.findall(r"[A-Za-z]{6,}", doc.page_content)
+        require(len(words) >= 2, f"top document has too little text: {doc.page_content[:80]!r}")
+        # A phrase has to be two words that really are adjacent in the text.
+        pair = re.search(r"([A-Za-z]{5,})\s+([A-Za-z]{5,})", doc.page_content)
+        require(pair, "no adjacent word pair in the top document to use as a phrase")
+        STATE["ops_fixture"] = {
+            "doc": doc,
+            "word": words[0],
+            "phrase": f"{pair.group(1)} {pair.group(2)}",
+        }
+        return STATE["ops_fixture"]
+
+    def t_ops_exclude_word() -> str:
+        fx = _operator_fixture()
+        after = demo_store.similarity_search(f"{QUERY} -{fx['word']}", k=10, hybrid=True)
+        ids = {d.id for d in after}
+        require(fx["doc"].id not in ids,
+                f"-{fx['word']} did not remove the document that contains it "
+                f"(id {fx['doc'].id[:8]}… still in {len(ids)} results)")
+        return f"-{fx['word']} removed its document from {len(after)} hybrid results"
+
+    check("-word excludes in hybrid mode, where the vector leg used to smuggle it back",
+          t_ops_exclude_word)
+
+    def t_ops_require_word() -> str:
+        fx = _operator_fixture()
+        got = demo_store.similarity_search(f"{QUERY} +{fx['word']}", k=20, hybrid=True)
+        require(got, f"+{fx['word']} returned nothing at all")
+        ids = {d.id for d in got}
+        require(fx["doc"].id in ids,
+                f"+{fx['word']} dropped the document that does contain it")
+        return f"+{fx['word']} kept its document, {len(got)} results"
+
+    check("+word is genuinely required in hybrid mode", t_ops_require_word)
+
+    def t_ops_exclude_phrase() -> str:
+        fx = _operator_fixture()
+        after = demo_store.similarity_search(f'{QUERY} -"{fx["phrase"]}"', k=10, hybrid=True)
+        ids = {d.id for d in after}
+        require(fx["doc"].id not in ids,
+                f'-"{fx["phrase"]}" did not remove the document containing that exact phrase')
+        return f'-"{fx["phrase"]}" removed its document from {len(after)} results'
+
+    check('-"phrase" excludes an exact phrase in hybrid mode', t_ops_exclude_phrase)
+
+    def t_ops_require_phrase() -> str:
+        fx = _operator_fixture()
+        got = demo_store.similarity_search(f'{QUERY} +"{fx["phrase"]}"', k=20, hybrid=True)
+        require(got, f'+"{fx["phrase"]}" returned nothing at all')
+        ids = {d.id for d in got}
+        require(fx["doc"].id in ids,
+                f'+"{fx["phrase"]}" dropped the document containing that exact phrase')
+        return f'+"{fx["phrase"]}" kept its document, {len(got)} results'
+
+    check('+"phrase" requires an exact phrase in hybrid mode', t_ops_require_phrase)
+
+    def t_ops_only_query() -> str:
+        fx = _operator_fixture()
+        got = demo_store.similarity_search(f"-{fx['word']}", k=5, hybrid=True)
+        require(got, "a query made of nothing but an exclusion must still return documents")
+        ids = {d.id for d in got}
+        require(fx["doc"].id not in ids,
+                "the excluded document came back on the operators-only path")
+        return (f"'-{fx['word']}' alone falls back to keyword search and still "
+                f"excludes, {len(got)} results")
+
+    check("a query that is nothing but operators still works and still excludes",
+          t_ops_only_query)
+
+    def t_ops_are_not_syntax() -> str:
+        # The operand is bound by reference, so Solr local params inside it are text.
+        # This must neither raise nor read another core.
+        got = demo_store.similarity_search(
+            QUERY + ' -{!join fromIndex=mcp_demo_d1__dense}x', k=3, hybrid=True)
+        require(isinstance(got, list), f"expected a list, got {type(got).__name__}")
+        require(all(isinstance(d, Document) for d in got), "results must be Documents")
+        return f"a '{{!join}}' operand stayed literal text, {len(got)} normal results"
+
+    check("an operand containing Solr local params is treated as text, not syntax",
+          t_ops_are_not_syntax)
 
     check("similarity_search validates the hybrid mode", t_bad_mode)
 
