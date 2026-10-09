@@ -231,13 +231,7 @@ class OpensolrVectorStore(VectorStore):
                     continue
             if info is None:
                 raise
-        version = str(info.get("solr_version", ""))
-        if check_vector and version and not version.startswith("9"):
-            raise OpensolrError(
-                f"Index {self._index!r} runs Solr {version}, but vector search "
-                f"requires Solr 9.x. Use lexical=True for keyword-only search on "
-                f"this index, or create a vector index in: {sorted(VECTOR_LOCATIONS)}."
-            )
+        # What the index can do is checked once by the client (check_schema), per operation
         self._checked = True
 
     def _doc_from_solr(self, solr_doc: Dict[str, Any], expanded: Optional[Dict[str, Any]] = None) -> Document:
@@ -261,10 +255,13 @@ class OpensolrVectorStore(VectorStore):
             for key, value in solr_doc.items():
                 if key.startswith("meta_") and key not in _INTERNAL_FIELDS:
                     metadata[key[5:]] = _flat(value)
-        # Where the hit lives: uri; a page of a PDF adds page, page_url, document_id, more_pages
-        for key, value in page_info(solr_doc, expanded).items():
-            if value not in ("", None):
-                metadata.setdefault(key, value)
+        # A page of a PDF also says where it lives (uri, page, page_url, document_id, more_pages);
+        # any other document keeps exactly the metadata it was sent with
+        where = page_info(solr_doc, expanded)
+        if where.get("page"):
+            for key, value in where.items():
+                if value not in ("", None):
+                    metadata.setdefault(key, value)
         return Document(
             id=str(_flat(solr_doc.get("id", ""))),
             page_content=str(content),
@@ -357,6 +354,24 @@ class OpensolrVectorStore(VectorStore):
             metadata=metadata, wait=wait, timeout=timeout,
         )
 
+    def check_schema(self) -> Dict[str, Any]:
+        """Whether this index is ready for every feature of the store, and exactly why not.
+
+        Returns the platform's check: ``ready``, ``capabilities`` (``ingestion``,
+        ``vector_search``, ``pdf_pages``, ``keyword_search``), the server, its Solr
+        version, the fields and types that differ from the Opensolr vector schema,
+        ``problems`` and ``fix``. The store runs this check once on its own.
+        """
+        return self._client.check_schema(self._index)
+
+    def apply_schema(self, force: bool = False) -> Dict[str, Any]:
+        """Install the Opensolr vector schema on this index (an index of a vector region).
+
+        It replaces the index configuration; an index that already holds documents needs
+        ``force=True``, and those documents must be sent again. Returns the new check.
+        """
+        return self._client.apply_schema(self._index, force=force)
+
     def delete(
         self,
         ids: Optional[List[str]] = None,
@@ -448,7 +463,7 @@ class OpensolrVectorStore(VectorStore):
             group_pages: A PDF indexed page by page comes back once, as its
                 best page: ``metadata`` carries ``page``, ``page_url`` (opens the
                 PDF at that page), ``document_id`` and ``more_pages`` (its other
-                matching pages). On by default. Every hit carries ``uri``.
+                matching pages) and its ``uri``. On by default.
         """
         self._ensure_index(check_vector=not lexical)
         # Checked before anything is embedded: a malformed date is the caller's, not a GPU call's
@@ -496,6 +511,8 @@ class OpensolrVectorStore(VectorStore):
         if hybrid and mode not in _HYBRID_MODES:
             raise ValueError(f"mode must be one of {_HYBRID_MODES}, got {mode!r}")
 
+        # An index without the vector fields says so before an embedding is paid for
+        self._client.require_capability(self._index, "vector_search")
         # The embedder must never see an operator: it has no concept of negation, so a '-'
         # term reads as one more word of the question and moves the results towards exactly
         # what the caller asked to remove.
@@ -700,6 +717,7 @@ class OpensolrVectorStore(VectorStore):
         **kwargs: Any,
     ) -> List[Document]:
         self._ensure_index()
+        self._client.require_capability(self._index, "vector_search")
         params: Dict[str, Any] = {
             "q": self._knn_query(embedding, max(k, 10)),
             "rows": k,

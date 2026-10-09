@@ -14,11 +14,14 @@ import re
 import json
 import time
 import hashlib
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 
 import httpx
+
+_log = logging.getLogger("opensolr")
 
 MGMT_BASE = "https://opensolr.com/solr_manager/api"
 AI_BASE = "https://api.opensolr.com/solr_manager/api"
@@ -743,6 +746,29 @@ class OpensolrError(RuntimeError):
     """Raised when an Opensolr API call fails."""
 
 
+class OpensolrSolrError(OpensolrError, httpx.HTTPStatusError):
+    """Solr refused a request on an index: the message carries Solr's own reason. Also an
+    ``httpx.HTTPStatusError``, so code that caught that before still catches it."""
+
+    def __init__(self, message: str, response: "httpx.Response") -> None:
+        httpx.HTTPStatusError.__init__(self, message, request=response.request, response=response)
+
+
+class OpensolrSchemaError(OpensolrError):
+    """The index cannot do what was asked: it is outside the vector regions, or its schema
+    lacks what the operation needs. ``report`` is the full check (see ``check_schema``)."""
+
+    def __init__(self, index: str, capability: str, report: Dict[str, Any]) -> None:
+        self.index = index
+        self.capability = capability
+        self.report = report
+        what = OpensolrClient.CAPABILITY_TEXT.get(capability, capability)
+        problems = " ".join(report.get("problems") or []) or "The index check says it cannot."
+        fix = (report.get("fix") or {}).get("text") or ""
+        super().__init__(f"Index {index!r} cannot {what}. {problems} {fix} "
+                         f"(client.check_schema({index!r}) shows the details.)".replace("  ", " "))
+
+
 class OpensolrClient:
     """Authenticated client for Opensolr management + AI endpoints.
 
@@ -758,8 +784,9 @@ class OpensolrClient:
         self.api_key = api_key
         self._http = httpx.Client(timeout=timeout, follow_redirects=True)
         self._core_info_cache: Dict[str, Dict[str, Any]] = {}
-        # indexes whose schema has no PDF page fields: searched and read without them
-        self._flat_indexes: set = set()
+        # the schema check of each index, made once (check_schema); when it could not run
+        self._schema_reports: Dict[str, Dict[str, Any]] = {}
+        self._schema_failed: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # low level                                                          #
@@ -792,8 +819,20 @@ class OpensolrClient:
         except json.JSONDecodeError as exc:
             raise OpensolrError(f"{label}: non-JSON response: {resp.text[:200]}") from exc
         if isinstance(body, dict) and body.get("status") is False:
-            raise OpensolrError(f"{label}: {body.get('msg', body)}")
+            detail = body.get("detail")
+            raise OpensolrError(f"{label}: {body.get('msg', body)}" + (f": {detail}" if detail else ""))
         return body
+
+    def _solr_answer(self, index: str, what: str, resp: "httpx.Response") -> Dict[str, Any]:
+        """Solr's JSON, or :class:`OpensolrSolrError` with Solr's own reason."""
+        if resp.status_code >= 400:
+            try:
+                why = (resp.json().get("error") or {}).get("msg") or ""
+            except (ValueError, AttributeError):
+                why = re.sub(r"<[^>]+>", " ", resp.text)[:300].strip()
+            raise OpensolrSolrError(
+                f"Solr refused the {what} on index {index} (HTTP {resp.status_code}): {why or resp.reason_phrase}", resp)
+        return resp.json()
 
     def _post_with_retry(self, *, url: str, label: str, **kwargs: Any) -> "httpx.Response":
         """POST, retrying only when the connection failed BEFORE a response was produced.
@@ -942,6 +981,7 @@ class OpensolrClient:
         ``wait=True``, polls ``ingest_status`` until the job completes
         (the queue is processed every minute).
         """
+        self.require_capability(index, "ingestion")
         resp = self._post_with_retry(label="ingest", url=
             f"{AI_BASE}/ingest",
             json={**self._auth_params(), "core_name": index, "documents": documents},
@@ -1038,8 +1078,7 @@ class OpensolrClient:
     def solr_select(self, index: str, params: Dict[str, Any]) -> Dict[str, Any]:
         base, auth = self.solr_endpoint(index)
         resp = self._post_with_retry(label="solr_select", url=f"{base}/select", data={"wt": "json", **params}, auth=auth)
-        resp.raise_for_status()
-        return resp.json()
+        return self._solr_answer(index, "search", resp)
 
     def hybrid_search(
         self,
@@ -1075,6 +1114,7 @@ class OpensolrClient:
         if not 0.0 <= alpha_f <= 1.0:
             raise ValueError(f"alpha must be between 0 and 1, got {alpha_f}")
 
+        self.require_capability(index, "vector_search")
         clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
         vector = self.embed(index, query, is_query=True)
         compact = json.dumps(vector, separators=(",", ":"))
@@ -1234,8 +1274,91 @@ class OpensolrClient:
             json=payload,
             auth=auth,
         )
-        resp.raise_for_status()
-        return resp.json()
+        return self._solr_answer(index, "update", resp)
+
+    # ------------------------------------------------------------------ #
+    # the Opensolr vector schema: checked once per index, installed on request #
+    # ------------------------------------------------------------------ #
+
+    #: Seconds before a schema check that could not run is tried again (never on every call).
+    SCHEMA_RETRY_SECONDS = 300.0
+
+    #: What each capability lets a client do, for the error messages.
+    CAPABILITY_TEXT = {
+        "ingestion": "take documents or files through Data Ingestion",
+        "vector_search": "be searched by meaning (vector or hybrid search)",
+        "pdf_pages": "return PDF pages",
+        "keyword_search": "be searched by keywords",
+    }
+
+    def check_schema(self, index: str) -> Dict[str, Any]:
+        """Whether an index is ready for the Opensolr packages, and every reason when it is not.
+
+        One request to the platform, which reads the index's schema and compares it with the
+        Opensolr vector schema. The answer carries ``ready``, ``capabilities``
+        (``ingestion``, ``vector_search``, ``pdf_pages``, ``keyword_search``), the server,
+        the Solr version, whether the server is in a vector region, the fields and types
+        that are missing or different, ``problems`` (sentences) and ``fix`` (``none``,
+        ``apply_schema`` or ``new_index``, with what to do).
+        """
+        return self.mgmt("check_schema", core_name=index)
+
+    def apply_schema(self, index: str, force: bool = False) -> Dict[str, Any]:
+        """Install the Opensolr vector schema on an index of a vector region.
+
+        It replaces the index configuration with the one every Opensolr vector index runs,
+        so Data Ingestion, vector and hybrid search and PDF pages all work on it. An index
+        that already holds documents needs ``force=True``: those documents keep the fields
+        they were written with and must be sent again. An index outside the vector regions
+        cannot take it: the error says where to create one. Returns the new check.
+        """
+        self._schema_reports.pop(index, None)
+        self._schema_failed.pop(index, None)
+        body = self.mgmt("apply_schema", core_name=index, force="1" if force else "0")
+        check = body.get("check") if isinstance(body, dict) else None
+        if isinstance(check, dict) and check.get("status") is True:
+            self._schema_reports[index] = check
+        return body
+
+    def schema_report(self, index: str) -> Optional[Dict[str, Any]]:
+        """The check of an index, made once for this client (a check that could not run is
+        tried again after :data:`SCHEMA_RETRY_SECONDS`, and nothing is concluded from it)."""
+        if index in self._schema_reports:
+            return self._schema_reports[index]
+        failed_at = self._schema_failed.get(index)
+        if failed_at is not None and time.time() - failed_at < self.SCHEMA_RETRY_SECONDS:
+            return None
+        try:
+            report = self.check_schema(index)
+        except OpensolrError as exc:
+            self._schema_failed[index] = time.time()
+            _log.warning("Opensolr: the schema of index %s could not be checked (%s); working as before, without the check", index, exc)
+            return None
+        self._schema_failed.pop(index, None)
+        self._schema_reports[index] = report
+        if not report.get("ready"):
+            fix = (report.get("fix") or {}).get("text") or ""
+            _log.warning("Opensolr: index %s is not on the Opensolr vector schema: %s %s", index,
+                         " ".join(report.get("problems") or []), fix)
+        return report
+
+    def require_capability(self, index: str, capability: str) -> None:
+        """Raise :class:`OpensolrSchemaError` when the index's check says it cannot do this.
+
+        Uses the check made once for this client; when the check could not run, nothing is
+        blocked and the operation runs as it always did.
+        """
+        report = self.schema_report(index)
+        if report is None:
+            return
+        caps = report.get("capabilities") or {}
+        if caps.get(capability) is False:
+            raise OpensolrSchemaError(index, capability, report)
+
+    def has_capability(self, index: str, capability: str) -> bool:
+        """True only when the index's check says it can (an unknown answer is False)."""
+        report = self.schema_report(index)
+        return bool(report and (report.get("capabilities") or {}).get(capability))
 
     # ------------------------------------------------------------------ #
     # PDF pages, documents, pictures                                     #
@@ -1244,22 +1367,16 @@ class OpensolrClient:
     def select_grouped(self, index: str, params: Dict[str, Any], group_pages: bool = True) -> Dict[str, Any]:
         """``solr_select`` with the pages of each PDF grouped under its best page.
 
-        See :func:`apply_page_grouping`. An index whose schema has no page fields is searched
-        as it is, and remembered, so it is asked once.
+        See :func:`apply_page_grouping`. Grouped only when the index's check (made once)
+        says it has the PDF page fields; otherwise searched as it is.
         """
-        if not group_pages or index in self._flat_indexes:
+        if not group_pages or not self.has_capability(index, "pdf_pages"):
             return self.solr_select(index, params)
         grouped = dict(params)
         if isinstance(grouped.get("fq"), list):
             grouped["fq"] = list(grouped["fq"])
         apply_page_grouping(grouped)
-        try:
-            return self.solr_select(index, grouped)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 400 and PARENT_FIELD in exc.response.text:
-                self._flat_indexes.add(index)
-                return self.solr_select(index, params)
-            raise
+        return self.solr_select(index, grouped)
 
     def read_document(
         self,
@@ -1287,24 +1404,17 @@ class OpensolrClient:
         last = min(last, first + READ_MAX_PAGES - 1)
         esc = key.replace("\\", "\\\\").replace('"', '\\"')
         fl = "id,uri,title,description,text,content_type,creation_date,meta_ext_id"
-        docs: List[Dict[str, Any]] = []
-        if index not in self._flat_indexes:
-            try:
-                body = self.solr_select(index, {
-                    "q": f'id:"{esc}" OR {PARENT_FIELD}:"{esc}" OR meta_ext_id:"{esc}"',
-                    "fq": f"(*:* -{PAGE_FIELD}:[* TO *]) OR {PAGE_FIELD}:[{first} TO {last}]",
-                    "sort": f"{PAGE_FIELD} asc",
-                    "rows": last - first + 1,
-                    "fl": f"{fl},{PAGE_FIELD},{PARENT_FIELD}",
-                })
-                docs = body.get("response", {}).get("docs", [])
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code != 400 or (PAGE_FIELD not in exc.response.text and PARENT_FIELD not in exc.response.text):
-                    raise
-                self._flat_indexes.add(index)
-        if index in self._flat_indexes:
+        if self.has_capability(index, "pdf_pages"):
+            body = self.solr_select(index, {
+                "q": f'id:"{esc}" OR {PARENT_FIELD}:"{esc}" OR meta_ext_id:"{esc}"',
+                "fq": f"(*:* -{PAGE_FIELD}:[* TO *]) OR {PAGE_FIELD}:[{first} TO {last}]",
+                "sort": f"{PAGE_FIELD} asc",
+                "rows": last - first + 1,
+                "fl": f"{fl},{PAGE_FIELD},{PARENT_FIELD}",
+            })
+        else:
             body = self.solr_select(index, {"q": f'id:"{esc}" OR meta_ext_id:"{esc}"', "rows": 1, "fl": fl})
-            docs = body.get("response", {}).get("docs", [])
+        docs: List[Dict[str, Any]] = body.get("response", {}).get("docs", [])
         if not docs:
             raise OpensolrError(f"read_document: nothing in {index} for {document!r}")
 
@@ -1521,6 +1631,8 @@ class OpensolrClient:
         Returns ``{"documents": [...], "pending": [...], "failed": [...], "jobs": [...]}``;
         ``jobs`` are the Data Ingestion job ids (``wait=True`` blocks until they are done).
         """
+        # before a byte is sent: an index that cannot take Data Ingestion says so now, not after the uploads
+        self.require_capability(index, "ingestion")
         meta = {str(k): v for k, v in (metadata or {}).items() if isinstance(v, (str, int, float, bool))}
         root = Path(path).expanduser()
         files = list_files(root, pattern, recursive)

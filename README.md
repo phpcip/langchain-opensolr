@@ -183,8 +183,9 @@ text from PDF/DOCX/XLSX for you.
 ## Lexical-only mode
 
 Don't need vectors? Pure keyword search skips the embedding call entirely —
-zero AI quota, and it works on **any** Opensolr index, including non-vector
-ones and older Solr versions.
+zero AI quota. It runs on any Opensolr index that has `title`, `description` and
+`text` fields, including indexes outside the vector regions and older Solr
+versions (see [Index requirements](#index-requirements)).
 
 ## Search by image
 
@@ -254,7 +255,7 @@ Data Ingestion with `rtf`, PDFs found by the Web Crawler), a search returns each
 **once**, as its best page. Its metadata carries `page` (the page number),
 `page_url` (opens the PDF at that page, `...pdf#page=14`), `document_id`,
 `more_pages` (its other matching pages, each with `page` and `page_url`) and
-`matching_pages`; every hit carries its `uri`. `group_pages=False` returns the pages
+`matching_pages`, and its `uri`; any other hit keeps exactly the metadata it was sent with. `group_pages=False` returns the pages
 as separate results.
 
 ## Searching a period
@@ -268,6 +269,74 @@ docs = vs.similarity_search("rate decision", k=5, hybrid=True,
 ```
 
 They combine with every other option — filters, `fresh_bias`, hybrid or lexical.
+
+## Index requirements
+
+Everything this package does runs on an Opensolr index that sits in a **vector
+region** and carries the **Opensolr vector schema** — the configuration every
+Opensolr vector index runs. An index created through the package (`create_index`,
+`create_if_missing`) has both. An index made elsewhere may not: a server outside
+the vector regions, an older Solr version, or a schema of its own.
+
+**The check is automatic.** The first time the package touches an index, it asks
+the platform once whether that index can do what is asked: one request per index
+per client, kept for the client's life, never one per search. If the check itself
+cannot run (a network error, the platform busy), nothing is blocked: the
+operation runs exactly as it always did, and the check is tried again after 5
+minutes. When an index differs from the Opensolr vector schema, a warning is logged
+once, on the `opensolr` logger, with the reasons and the fix.
+
+What the check gates — only what cannot work otherwise:
+
+| Capability | Needed for | When it is missing |
+|---|---|---|
+| `ingestion` | Data Ingestion: adding documents and indexing files | The index is outside the vector regions: refused before a document or a byte is sent |
+| `vector_search` | Vector and hybrid search | The index has no vector field of the right size: refused before any embedding is paid for |
+| `pdf_pages` | Grouping the pages of a PDF in search results | Results come back ungrouped, as before |
+| `keyword_search` | Keyword (lexical) search | Never blocked |
+
+**The errors say exactly what is going on.** A blocked operation raises
+`OpensolrSchemaError` (a subclass of `OpensolrError`) with `.index`, `.capability`
+and `.report` (the full check), and a message with every reason and the fix:
+
+```
+Index 'shop_it' cannot take documents or files through Data Ingestion. Index shop_it
+is on IT-SOLR-9-6 (Milano, Italy), which is not a vector region: Data Ingestion,
+server-side embeddings and hybrid search run only on the servers of a vector region
+(DE-SOLR-9 (Germany, Solr 9.00), FINLAND9 (Finland, Solr 9.60), ...). This index
+cannot be made ready: create a new index in one of the vector regions (...), for
+example with create_index, and send your documents there.
+```
+
+When Solr itself refuses a request, `OpensolrSolrError` carries Solr's own reason
+and the index name; it is still an `httpx.HTTPStatusError`, so code that caught
+that before keeps working.
+
+```python
+from langchain_opensolr import OpensolrVectorStore, OpensolrSchemaError, OpensolrSolrError
+
+try:
+    vs.add_files("./contracts")
+except OpensolrSchemaError as e:
+    print(e.capability, e.report["fix"]["action"])   # ingestion new_index
+```
+
+**See the details, and fix what can be fixed:**
+
+```python
+vs.check_schema()   # ready, capabilities, server, Solr version, missing / different fields, problems, fix
+vs.apply_schema(force=False)   # installs the Opensolr vector schema; force=True when the index holds documents
+```
+
+`apply_schema` exists so an index of a vector region whose configuration was
+changed, or never set, can take everything this package does without being
+recreated: it installs the same configuration every Opensolr vector index runs,
+and **replaces the index configuration**. An index that already holds documents
+needs `force=True`; those documents keep the fields they were written with and
+must be sent again. An index outside the vector regions cannot take it — create
+a new index in a region from `vector_regions` and send your documents there. The
+package never installs the schema on its own.
+
 
 ## Your index schema
 
