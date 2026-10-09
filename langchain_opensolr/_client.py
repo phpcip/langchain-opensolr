@@ -13,7 +13,10 @@ from __future__ import annotations
 import re
 import json
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import hashlib
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from urllib.parse import quote
 
 import httpx
 
@@ -600,6 +603,142 @@ def build_instruction(context: str, query: str) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# PDF pages and date ranges                                                     #
+# --------------------------------------------------------------------------- #
+# A PDF indexed from its file (Data Ingestion with rtf, the web crawler) is one Solr
+# document per page: page_i is the page number, uri_id_s the id of the PDF it belongs to.
+PAGE_FIELD = "page_i"
+PARENT_FIELD = "uri_id_s"
+
+#: Other matching pages returned under each PDF when the results are grouped.
+GROUP_EXPAND_ROWS = 4
+
+#: Most pages one read_document call returns.
+READ_MAX_PAGES = 500
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_META_FIELD_RE = re.compile(r"[^a-z0-9_]+")
+
+
+def date_range_filter(date_from: Optional[str] = None, date_to: Optional[str] = None) -> Optional[str]:
+    """Solr filter on ``creation_date`` for a period, both ends included (``YYYY-MM-DD``).
+
+    Either end may be left out. Returns ``None`` when neither is given.
+    """
+    import datetime
+
+    bounds = []
+    for name, value, clock in (("date_from", date_from, "T00:00:00Z"), ("date_to", date_to, "T23:59:59Z")):
+        if value is None or str(value).strip() == "":
+            bounds.append("*")
+            continue
+        text = str(value).strip()
+        if not _DATE_RE.match(text):
+            raise ValueError(f"{name} must be YYYY-MM-DD, got {value!r}")
+        try:
+            datetime.date.fromisoformat(text)
+        except ValueError:
+            raise ValueError(f"{name} is not a real date: {value!r}") from None
+        bounds.append(text + clock)
+    if bounds == ["*", "*"]:
+        return None
+    if "*" not in bounds and bounds[0] > bounds[1]:
+        raise ValueError(f"date_from ({date_from}) is after date_to ({date_to})")
+    return f"creation_date:[{bounds[0]} TO {bounds[1]}]"
+
+
+def add_filters(params: Dict[str, Any], *filters: Optional[str]) -> Dict[str, Any]:
+    """Append filter queries to ``params["fq"]``, keeping the ones already there."""
+    extra = [f for f in filters if f]
+    if not extra:
+        return params
+    existing = params.get("fq")
+    if existing is None:
+        params["fq"] = extra
+    elif isinstance(existing, list):
+        params["fq"] = existing + extra
+    else:
+        params["fq"] = [existing] + extra
+    return params
+
+
+def apply_page_grouping(params: Dict[str, Any]) -> Dict[str, Any]:
+    """One result per PDF (its best page), with its other matching pages in Solr's expanded section.
+
+    Documents that are not pages of a PDF stay separate results (``nullPolicy=expand``). The
+    collapse sort is passed by reference so {!hybrid} ranks every page before the grouping.
+    """
+    add_filters(params, "{!collapse field=" + PARENT_FIELD + " nullPolicy=expand sort=$qgsort}")
+    params["qgsort"] = "score desc," + PAGE_FIELD + " asc"
+    params["expand"] = "true"
+    params["expand.rows"] = GROUP_EXPAND_ROWS
+    params["expand.sort"] = "score desc," + PAGE_FIELD + " asc"
+    return params
+
+
+def page_url(uri: str, page: Optional[int]) -> str:
+    """The link that opens a PDF at one page."""
+    if uri and page and "#" not in uri:
+        return f"{uri}#page={int(page)}"
+    return uri
+
+
+def _first(value: Any) -> Any:
+    return value[0] if isinstance(value, list) and value else value
+
+
+def page_info(solr_doc: Dict[str, Any], expanded: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Where a hit lives: ``uri``; for a page of a PDF also ``page``, ``page_url``, ``document_id``
+    and, when the results were grouped, the other matching ``more_pages`` of that PDF."""
+    uri = str(_first(solr_doc.get("uri")) or "")
+    out: Dict[str, Any] = {"uri": uri}
+    try:
+        page = int(_first(solr_doc.get(PAGE_FIELD)) or 0)
+    except (TypeError, ValueError):
+        page = 0
+    if page < 1:
+        return out
+    parent = str(_first(solr_doc.get(PARENT_FIELD)) or "")
+    out.update(page=page, page_url=page_url(uri, page), document_id=parent)
+    group = (expanded or {}).get(parent) if parent else None
+    if isinstance(group, dict) and group.get("docs"):
+        more = []
+        for d in group["docs"]:
+            try:
+                n = int(_first(d.get(PAGE_FIELD)) or 0)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                more.append({"page": n, "page_url": page_url(str(_first(d.get("uri")) or uri), n)})
+        out["more_pages"] = more
+        out["matching_pages"] = 1 + int(group.get("numFound") or len(more))
+    return out
+
+
+def list_files(path: Union[str, Path], pattern: str = "*", recursive: bool = True) -> List[Path]:
+    """The files under ``path`` (or ``path`` itself when it is a file), hidden ones left out."""
+    root = Path(path).expanduser()
+    if root.is_file():
+        return [root]
+    if not root.is_dir():
+        raise FileNotFoundError(f"No such file or folder: {path}")
+    found = root.rglob(pattern) if recursive else root.glob(pattern)
+    return sorted(
+        f for f in found
+        if f.is_file() and not any(part.startswith(".") for part in f.relative_to(root).parts)
+    )
+
+
+def file_source(root: Union[str, Path], file: Union[str, Path]) -> str:
+    """A file's name in the index: its path from the folder that was sent, the folder's name first."""
+    root_p = Path(root).expanduser().resolve()
+    file_p = Path(file).expanduser().resolve()
+    if root_p.is_file() or root_p == file_p:
+        return file_p.name
+    return (Path(root_p.name) / file_p.relative_to(root_p)).as_posix()
+
+
 class OpensolrError(RuntimeError):
     """Raised when an Opensolr API call fails."""
 
@@ -619,6 +758,8 @@ class OpensolrClient:
         self.api_key = api_key
         self._http = httpx.Client(timeout=timeout, follow_redirects=True)
         self._core_info_cache: Dict[str, Dict[str, Any]] = {}
+        # indexes whose schema has no PDF page fields: searched and read without them
+        self._flat_indexes: set = set()
 
     # ------------------------------------------------------------------ #
     # low level                                                          #
@@ -641,14 +782,17 @@ class OpensolrClient:
         url = f"{base}/{method}"
         data = {**self._auth_params(), **params}
         resp = self._post_with_retry(url=url, data=data, label=method)
+        return self._answer(method, resp)
+
+    def _answer(self, label: str, resp: "httpx.Response") -> Any:
         if resp.status_code >= 500:
-            raise OpensolrError(f"{method}: HTTP {resp.status_code}: {resp.text[:200]}")
+            raise OpensolrError(f"{label}: HTTP {resp.status_code}: {resp.text[:200]}")
         try:
             body = resp.json()
         except json.JSONDecodeError as exc:
-            raise OpensolrError(f"{method}: non-JSON response: {resp.text[:200]}") from exc
+            raise OpensolrError(f"{label}: non-JSON response: {resp.text[:200]}") from exc
         if isinstance(body, dict) and body.get("status") is False:
-            raise OpensolrError(f"{method}: {body.get('msg', body)}")
+            raise OpensolrError(f"{label}: {body.get('msg', body)}")
         return body
 
     def _post_with_retry(self, *, url: str, label: str, **kwargs: Any) -> "httpx.Response":
@@ -1092,6 +1236,342 @@ class OpensolrClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    # ------------------------------------------------------------------ #
+    # PDF pages, documents, pictures                                     #
+    # ------------------------------------------------------------------ #
+
+    def select_grouped(self, index: str, params: Dict[str, Any], group_pages: bool = True) -> Dict[str, Any]:
+        """``solr_select`` with the pages of each PDF grouped under its best page.
+
+        See :func:`apply_page_grouping`. An index whose schema has no page fields is searched
+        as it is, and remembered, so it is asked once.
+        """
+        if not group_pages or index in self._flat_indexes:
+            return self.solr_select(index, params)
+        grouped = dict(params)
+        if isinstance(grouped.get("fq"), list):
+            grouped["fq"] = list(grouped["fq"])
+        apply_page_grouping(grouped)
+        try:
+            return self.solr_select(index, grouped)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 400 and PARENT_FIELD in exc.response.text:
+                self._flat_indexes.add(index)
+                return self.solr_select(index, params)
+            raise
+
+    def read_document(
+        self,
+        index: str,
+        document: str,
+        page_from: int = 1,
+        page_to: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """The whole text of one indexed document.
+
+        ``document`` is its id, the id it was sent with (``meta_ext_id``) or its URL. A PDF
+        indexed page by page comes back as its ``pages`` in order, ``page_from`` to
+        ``page_to`` (at most :data:`READ_MAX_PAGES` per call), with ``pages_indexed``; any
+        other document as one ``text``.
+        """
+        key = str(document or "").strip()
+        if not key:
+            raise ValueError("document is required")
+        if key.startswith(("http://", "https://")):
+            key = hashlib.md5(key.rstrip("/").encode("utf-8")).hexdigest()
+        first = max(1, int(page_from or 1))
+        last = int(page_to) if page_to else first + READ_MAX_PAGES - 1
+        if last < first:
+            raise ValueError(f"page_to ({page_to}) is before page_from ({page_from})")
+        last = min(last, first + READ_MAX_PAGES - 1)
+        esc = key.replace("\\", "\\\\").replace('"', '\\"')
+        fl = "id,uri,title,description,text,content_type,creation_date,meta_ext_id"
+        docs: List[Dict[str, Any]] = []
+        if index not in self._flat_indexes:
+            try:
+                body = self.solr_select(index, {
+                    "q": f'id:"{esc}" OR {PARENT_FIELD}:"{esc}" OR meta_ext_id:"{esc}"',
+                    "fq": f"(*:* -{PAGE_FIELD}:[* TO *]) OR {PAGE_FIELD}:[{first} TO {last}]",
+                    "sort": f"{PAGE_FIELD} asc",
+                    "rows": last - first + 1,
+                    "fl": f"{fl},{PAGE_FIELD},{PARENT_FIELD}",
+                })
+                docs = body.get("response", {}).get("docs", [])
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 400 or (PAGE_FIELD not in exc.response.text and PARENT_FIELD not in exc.response.text):
+                    raise
+                self._flat_indexes.add(index)
+        if index in self._flat_indexes:
+            body = self.solr_select(index, {"q": f'id:"{esc}" OR meta_ext_id:"{esc}"', "rows": 1, "fl": fl})
+            docs = body.get("response", {}).get("docs", [])
+        if not docs:
+            raise OpensolrError(f"read_document: nothing in {index} for {document!r}")
+
+        def _text(d: Dict[str, Any]) -> str:
+            t = d.get("text")
+            return "\n".join(str(x) for x in t) if isinstance(t, list) else str(t or "")
+
+        head = docs[0]
+        uri = str(_first(head.get("uri")) or "")
+        out: Dict[str, Any] = {
+            "id": str(_first(head.get(PARENT_FIELD)) or _first(head.get("id")) or ""),
+            "uri": uri,
+            "title": str(_first(head.get("title")) or ""),
+            "content_type": str(_first(head.get("content_type")) or ""),
+            "date": str(_first(head.get("creation_date")) or ""),
+        }
+        pages = []
+        for d in docs:
+            try:
+                n = int(_first(d.get(PAGE_FIELD)) or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                pages.append({"page": n, "page_url": page_url(uri, n), "text": _text(d)})
+        if not pages:
+            out["text"] = _text(head)
+            return out
+        esc_parent = out["id"].replace("\\", "\\\\").replace('"', '\\"')
+        total = self.solr_select(index, {"q": f'{PARENT_FIELD}:"{esc_parent}"', "rows": 0})
+        out.update(
+            pages_indexed=int(total.get("response", {}).get("numFound") or len(pages)),
+            page_from=pages[0]["page"],
+            page_to=pages[-1]["page"],
+            pages=pages,
+        )
+        return out
+
+    def describe_image(self, index: str, image_b64: str) -> Dict[str, Any]:
+        """What a picture shows (``caption``), the text printed on it (``text``, read by OCR),
+        its ``labels`` and any barcodes / QR ``codes``."""
+        ans = self.image_to_text(index, image_b64, top_k=8)
+        labels = [l["label"] for l in (ans.get("labels") or []) if isinstance(l, dict) and l.get("label")]
+        codes: List[str] = []
+        for c in ans.get("codes") or []:
+            value = c.get("text") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+            if value:
+                codes.append(value)
+        mode = ans.get("mode") or ""
+        ocr = str(ans.get("ocr_text") or "").strip() or (str(ans.get("text") or "").strip() if mode == "ocr" else "")
+        caption = str(ans.get("caption") or "").strip() or (str(ans.get("text") or "").strip() if mode != "ocr" else "")
+        return {"caption": caption, "text": ocr, "labels": labels, "codes": codes}
+
+    # ------------------------------------------------------------------ #
+    # files: read on Opensolr (text, OCR, a PDF page by page), indexed  #
+    # ------------------------------------------------------------------ #
+
+    #: Seconds between two looks at files that are still being read.
+    FILE_POLL_SECONDS = 3.0
+
+    #: Job ids one file_extract_status call accepts.
+    FILE_STATUS_MAX = 20
+
+    @staticmethod
+    def _file_hash(path: Path) -> Tuple[str, int]:
+        digest = hashlib.sha1()
+        size = 0
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+        return digest.hexdigest(), size
+
+    def upload_file(
+        self,
+        index: str,
+        file: Union[str, Path],
+        pages: bool = False,
+        text: bool = True,
+    ) -> Dict[str, Any]:
+        """Send one local file to be read on Opensolr: its text, its pictures through OCR, a PDF page by page.
+
+        The bytes travel in parts, and only once: a file this account already sent (same
+        content) is answered without sending it again. Returns ``job_id`` and ``state``
+        (``queued``, ``processing``, ``done`` or ``failed``); once done, ``mime`` and the
+        ``text``, or with ``pages=True`` the ``pages`` of a PDF (``page``, ``text``,
+        ``is_ocr``, ``lang``). ``text=False`` answers the state alone. The pictures read are
+        counted on the index owner's AI quota, 0.5 each.
+        """
+        path = Path(file).expanduser()
+        sha1, size = self._file_hash(path)
+        if size < 1:
+            raise OpensolrError(f"file_extract: {path.name} is empty")
+        form = {
+            "index_name": index, "sha1": sha1, "size": size, "name": path.name,
+            "pages": "1" if pages else "0", "text": "1" if text else "0",
+        }
+        ans = self.ai("file_extract", **form)
+        stuck = 0
+        with open(path, "rb") as fh:
+            while ans.get("state") == "upload":
+                offset = int(ans.get("received") or 0)
+                part_max = int(ans.get("max_part_bytes") or 0)
+                if part_max < 1 or offset >= size:
+                    raise OpensolrError(f"file_extract: {path.name}: unexpected upload state {str(ans)[:200]}")
+                fh.seek(offset)
+                part = fh.read(min(part_max, size - offset))
+                resp = self._post_with_retry(
+                    label="file_extract",
+                    url=f"{AI_BASE}/file_extract",
+                    data={**self._auth_params(), **form, "offset": offset},
+                    files={"part": (path.name, part, "application/octet-stream")},
+                )
+                ans = self._answer("file_extract", resp)
+                if ans.get("state") == "upload" and int(ans.get("received") or 0) <= offset:
+                    stuck += 1
+                    if stuck >= 3:
+                        raise OpensolrError(f"file_extract: {path.name}: the upload does not get past {offset} bytes")
+                else:
+                    stuck = 0
+        return ans
+
+    def file_status(
+        self,
+        index: str,
+        job_ids: Sequence[str],
+        pages: bool = False,
+        text: bool = True,
+    ) -> Dict[str, Dict[str, Any]]:
+        """State of files sent with :meth:`upload_file`, keyed by job id, with their text (or pages) once read."""
+        ids = list(dict.fromkeys(str(j) for j in job_ids if j))
+        out: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(ids), self.FILE_STATUS_MAX):
+            body = self.ai(
+                "file_extract_status", index_name=index, job_ids=json.dumps(ids[i : i + self.FILE_STATUS_MAX]),
+                pages="1" if pages else "0", text="1" if text else "0",
+            )
+            results = body.get("results") if isinstance(body, dict) else None
+            if not isinstance(results, dict):
+                raise OpensolrError(f"file_extract_status: unexpected response: {str(body)[:200]}")
+            out.update(results)
+        return out
+
+    def _wait_files(self, index: str, entries: List[Dict[str, Any]], pages: bool, text: bool, timeout: float) -> None:
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            waiting: Dict[str, List[Dict[str, Any]]] = {}
+            for e in entries:
+                if e.get("job_id") and e.get("state") in ("queued", "processing"):
+                    waiting.setdefault(e["job_id"], []).append(e)
+            if not waiting or time.time() >= deadline:
+                return
+            time.sleep(self.FILE_POLL_SECONDS)
+            for job_id, ans in self.file_status(index, list(waiting), pages=pages, text=text).items():
+                for e in waiting.get(job_id, []):
+                    e["state"] = ans.get("state") or "failed"
+                    for key in ("text", "pages", "mime", "error"):
+                        if key in ans:
+                            e[key] = ans[key]
+
+    def _send_files(self, index: str, files: Sequence[Union[str, Path]], pages: bool, text: bool) -> List[Dict[str, Any]]:
+        entries = []
+        for f in files:
+            entry: Dict[str, Any] = {"path": str(f)}
+            try:
+                ans = self.upload_file(index, f, pages=pages, text=text)
+                entry["job_id"] = ans.get("job_id")
+                entry["state"] = ans.get("state")
+                for key in ("text", "pages", "mime", "error"):
+                    if key in ans:
+                        entry[key] = ans[key]
+            except (OpensolrError, OSError) as exc:
+                entry.update(state="failed", error=str(exc))
+            entries.append(entry)
+        return entries
+
+    def extract_files(
+        self,
+        index: str,
+        files: Sequence[Union[str, Path]],
+        pages: bool = True,
+        timeout: float = 600.0,
+    ) -> List[Dict[str, Any]]:
+        """Read local files on Opensolr without indexing them (see :meth:`upload_file`).
+
+        One entry per file: ``path``, ``job_id``, ``state`` and, once ``done``, ``mime`` plus
+        the ``pages`` of a PDF (with ``pages=True``) or the ``text``; ``error`` when it could
+        not be read. Files still ``queued``/``processing`` when ``timeout`` runs out can be
+        asked for again: the bytes are not sent twice.
+        """
+        entries = self._send_files(index, files, pages=pages, text=True)
+        self._wait_files(index, entries, pages=pages, text=True, timeout=timeout)
+        return entries
+
+    def ingest_files(
+        self,
+        index: str,
+        path: Union[str, Path],
+        pattern: str = "*",
+        recursive: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+        wait: bool = False,
+        timeout: float = 600.0,
+    ) -> Dict[str, Any]:
+        """Index local files through Data Ingestion: one file, or every file of a folder.
+
+        Each file is read on Opensolr (its text, its pictures through OCR) and a PDF is
+        indexed one document per page, exactly like a PDF sent by URL with ``rtf``. Its
+        ``uri`` is ``https://ingest.opensolr.com/<index>/<source>``, where ``source`` is the
+        file's path from the folder sent (also in ``meta_source``), so sending it again
+        replaces it; its date is the file's modification time. ``metadata`` is added to every
+        document as ``meta_*`` fields. Files still being read when ``timeout`` runs out come
+        back under ``pending``: call again to index them, the bytes are not sent twice.
+
+        Returns ``{"documents": [...], "pending": [...], "failed": [...], "jobs": [...]}``;
+        ``jobs`` are the Data Ingestion job ids (``wait=True`` blocks until they are done).
+        """
+        meta = {str(k): v for k, v in (metadata or {}).items() if isinstance(v, (str, int, float, bool))}
+        root = Path(path).expanduser()
+        files = list_files(root, pattern, recursive)
+        entries = self._send_files(index, files, pages=False, text=False)
+        for e, f in zip(entries, files):
+            e["source"] = file_source(root, f)
+        self._wait_files(index, entries, pages=False, text=False, timeout=timeout)
+
+        documents: List[Dict[str, Any]] = []
+        pending: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        docs: List[Dict[str, Any]] = []
+        for e in entries:
+            if e.get("state") in ("queued", "processing"):
+                pending.append({"path": e["path"], "state": e["state"]})
+                continue
+            if e.get("state") != "done":
+                failed.append({"path": e["path"], "error": e.get("error") or e.get("state") or "not read"})
+                continue
+            src = e["source"]
+            uri = f"https://ingest.opensolr.com/{index}/{quote(src, safe='')}"
+            name = Path(e["path"])
+            doc: Dict[str, Any] = {
+                "uri": uri,
+                "title": (name.stem or name.name)[:250],
+                "description": src,
+                "rtf": True,
+                "file": e["job_id"],
+                "meta_ext_id": src,
+                "meta_source": src,
+                "meta_lc_json": json.dumps({"source": src, **meta}, ensure_ascii=False),
+            }
+            try:
+                doc["timestamp"] = int(name.stat().st_mtime)
+            except OSError:
+                pass
+            for key, value in meta.items():
+                field = "meta_" + _META_FIELD_RE.sub("_", key.lower()).strip("_")
+                if field not in ("meta_", "meta_lc_json", "meta_ext_id", "meta_source"):
+                    doc[field] = str(value)
+            docs.append(doc)
+            documents.append({
+                "path": e["path"], "source": src, "uri": uri,
+                "id": hashlib.md5(uri.encode("utf-8")).hexdigest(),
+            })
+        jobs: List[str] = []
+        for i in range(0, len(docs), 50):
+            body = self.ingest(index, docs[i : i + 50], wait=wait, timeout=timeout)
+            if isinstance(body, dict) and body.get("job_id"):
+                jobs.append(str(body["job_id"]))
+        return {"documents": documents, "pending": pending, "failed": failed, "jobs": jobs}
 
     def close(self) -> None:
         self._http.close()

@@ -36,8 +36,11 @@ from ._client import (
     VECTOR_LOCATIONS,
     OpensolrClient,
     OpensolrError,
+    add_filters,
     apply_fresh_bias,
     apply_search_operators,
+    date_range_filter,
+    page_info,
     parse_operators,
     resolve_location,
 )
@@ -237,7 +240,7 @@ class OpensolrVectorStore(VectorStore):
             )
         self._checked = True
 
-    def _doc_from_solr(self, solr_doc: Dict[str, Any]) -> Document:
+    def _doc_from_solr(self, solr_doc: Dict[str, Any], expanded: Optional[Dict[str, Any]] = None) -> Document:
         def _flat(v: Any) -> Any:
             if isinstance(v, list):
                 return v[0] if len(v) == 1 else v
@@ -258,6 +261,10 @@ class OpensolrVectorStore(VectorStore):
             for key, value in solr_doc.items():
                 if key.startswith("meta_") and key not in _INTERNAL_FIELDS:
                     metadata[key[5:]] = _flat(value)
+        # Where the hit lives: uri; a page of a PDF adds page, page_url, document_id, more_pages
+        for key, value in page_info(solr_doc, expanded).items():
+            if value not in ("", None):
+                metadata.setdefault(key, value)
         return Document(
             id=str(_flat(solr_doc.get("id", ""))),
             page_content=str(content),
@@ -322,6 +329,34 @@ class OpensolrVectorStore(VectorStore):
             self._client.ingest(self._index, docs[i : i + 50], wait=wait)
         return solr_ids
 
+    def add_files(
+        self,
+        path: Union[str, Path],
+        pattern: str = "*",
+        recursive: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+        wait: bool = False,
+        timeout: float = 600.0,
+    ) -> Dict[str, Any]:
+        """Index local files: one file, or every file of a folder.
+
+        Each file is read on Opensolr (its text, its pictures through OCR) and a PDF is
+        indexed one document per page, so a search finds the page that answers it.
+        Word, RTF, OpenDocument, text, HTML and picture files (scans) are one document
+        each. ``pattern`` picks a folder's files (``"*.pdf"``), ``metadata`` goes on
+        every document (filterable like any metadata). Sending the same files again
+        replaces them.
+
+        Returns ``{"documents", "pending", "failed", "jobs"}``: files still being read
+        when ``timeout`` ran out are under ``pending`` — call again to index them, the
+        bytes are not sent twice. ``wait=True`` blocks until the ingestion jobs are done.
+        """
+        self._ensure_index(check_vector=False)
+        return self._client.ingest_files(
+            self._index, path, pattern=pattern, recursive=recursive,
+            metadata=metadata, wait=wait, timeout=timeout,
+        )
+
     def delete(
         self,
         ids: Optional[List[str]] = None,
@@ -379,6 +414,9 @@ class OpensolrVectorStore(VectorStore):
         mode: str = "union",
         alpha: float = 0.5,
         fresh_bias: bool = False,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        group_pages: bool = True,
         **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
         """Return documents most similar to ``query`` with their scores.
@@ -404,8 +442,17 @@ class OpensolrVectorStore(VectorStore):
                 document with no ``creation_date`` is simply left unboosted.
                 Works on all three shapes above (kNN, hybrid, lexical). Off
                 by default.
+            date_from: Only documents dated on or after this day
+                (``YYYY-MM-DD``, on ``creation_date``).
+            date_to: Only documents dated on or before this day (``YYYY-MM-DD``).
+            group_pages: A PDF indexed page by page comes back once, as its
+                best page: ``metadata`` carries ``page``, ``page_url`` (opens the
+                PDF at that page), ``document_id`` and ``more_pages`` (its other
+                matching pages). On by default. Every hit carries ``uri``.
         """
         self._ensure_index(check_vector=not lexical)
+        # Checked before anything is embedded: a malformed date is the caller's, not a GPU call's
+        period = date_range_filter(date_from, date_to)
 
         params: Dict[str, Any] = {
             "rows": k,
@@ -435,12 +482,11 @@ class OpensolrVectorStore(VectorStore):
             # as the request's defType, so a top-level bf is not reliably its own.
             if fresh_bias:
                 apply_fresh_bias(params)
-            for fq in self._filter_to_fq(filter):
-                params.setdefault("fq", [])
-                params["fq"].append(fq)
-            body = self._client.solr_select(self._index, params)
+            add_filters(params, *self._filter_to_fq(filter), period)
+            body = self._client.select_grouped(self._index, params, group_pages)
+            expanded = body.get("expanded") or {}
             return [
-                (self._doc_from_solr(d), float(d.get("score", 0.0)))
+                (self._doc_from_solr(d, expanded), float(d.get("score", 0.0)))
                 for d in body["response"]["docs"]
             ]
 
@@ -479,15 +525,13 @@ class OpensolrVectorStore(VectorStore):
         if fresh_bias:
             apply_fresh_bias(params)
 
-        for i, fq in enumerate(self._filter_to_fq(filter)):
-            params.setdefault("fq", [])
-            params["fq"].append(fq)
+        add_filters(params, *self._filter_to_fq(filter), period)
 
-        body = self._client.solr_select(self._index, params)
-        docs = body["response"]["docs"]
+        body = self._client.select_grouped(self._index, params, group_pages)
+        expanded = body.get("expanded") or {}
         return [
-            (self._doc_from_solr(d), float(d.get("score", 0.0)))
-            for d in docs
+            (self._doc_from_solr(d, expanded), float(d.get("score", 0.0)))
+            for d in body["response"]["docs"]
         ]
 
     def similarity_search(

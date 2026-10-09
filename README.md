@@ -44,8 +44,8 @@ the server at both index and query time.
 
 ## Try it without an account
 
-There is a public demo account. Point the package at it and everything in this
-README works immediately, with no signup:
+There is a public demo account. Point the package at it and search, ingestion and
+answers work immediately, with no signup:
 
 ```bash
 export OPENSOLR_EMAIL=mcp@opensolr.com
@@ -55,6 +55,8 @@ export OPENSOLR_API_KEY=420b8b23e7b12dc8ab838932145a5065
 `mcp_demo_d1__dense` is already loaded with 300 news articles, so search, filtering
 and grounded answers work the moment you connect. You also get the full write path:
 create your own index on the account, ingest into it, query it, delete it.
+Reading files and pictures (the file loader and file indexing below, search by image)
+needs your own key: the shared demo key does not include them.
 
 Know what you are working with:
 
@@ -207,6 +209,64 @@ docs = vs.search_by_image("photo.jpg", using="all")      # labels + OCR + codes
 `search_by_image` accepts the same tuning as `similarity_search` — `hybrid`,
 `mode`, `alpha`, `fresh_bias`, `filter` — so an image query runs through the
 exact hybrid pipeline a text query does.
+
+## Local files: PDFs page by page, scans through OCR
+
+Read a file or a whole folder into LangChain `Document`s with `OpensolrLoader` —
+one Document per PDF page (`metadata["page"]`, from 1), one per any other file:
+
+```python
+from langchain_opensolr import OpensolrLoader
+
+loader = OpensolrLoader("./contracts", index="mysite__dense",
+                        email="you@example.com", api_key="YOUR_OPENSOLR_API_KEY",
+                        pattern="*.pdf")
+docs = loader.load()          # or loader.lazy_load()
+# metadata: source, page, is_ocr, language, content_type
+```
+
+Or index them straight into the store — no splitting, no loader, PDFs page by page:
+
+```python
+result = vs.add_files("./contracts", pattern="*.pdf", metadata={"team": "legal"}, wait=True)
+# {"documents": [{path, source, uri, id}], "pending": [], "failed": [], "jobs": [...]}
+```
+
+- Each file is read on Opensolr's servers: its text, the text in its pictures (OCR,
+  more than 100 languages), a short description of the pictures without text. Word,
+  RTF, OpenDocument, text, HTML and picture files (scans) are one document each; a
+  **PDF is one document per page**.
+- The bytes travel once: a file the account already sent (same content) is not
+  uploaded again. Pictures read by OCR count 0.5 of an AI request each; a file read
+  before is free.
+- Files still being read when `timeout` runs out are listed in `loader.pending` (or
+  `result["pending"]`): run again to get them, nothing is sent twice. Files that could
+  not be read are in `loader.failed` / `result["failed"]`.
+- An indexed file's `uri` is `https://ingest.opensolr.com/<index>/<source>`, where
+  `source` is its path from the folder you sent (`metadata["source"]` on every hit);
+  sending it again replaces it. Its date is the file's modification time.
+
+## PDF pages in search results
+
+On an index where PDFs are stored page by page (files indexed as above, PDFs sent to
+Data Ingestion with `rtf`, PDFs found by the Web Crawler), a search returns each PDF
+**once**, as its best page. Its metadata carries `page` (the page number),
+`page_url` (opens the PDF at that page, `...pdf#page=14`), `document_id`,
+`more_pages` (its other matching pages, each with `page` and `page_url`) and
+`matching_pages`; every hit carries its `uri`. `group_pages=False` returns the pages
+as separate results.
+
+## Searching a period
+
+`date_from` and `date_to` (`YYYY-MM-DD`, both included, either one can be left out)
+keep only the documents dated in that period (`creation_date`):
+
+```python
+docs = vs.similarity_search("rate decision", k=5, hybrid=True,
+                            date_from="2026-01-01", date_to="2026-03-31")
+```
+
+They combine with every other option — filters, `fresh_bias`, hybrid or lexical.
 
 ## Your index schema
 
