@@ -53,8 +53,10 @@ export OPENSOLR_API_KEY=420b8b23e7b12dc8ab838932145a5065
 ```
 
 `mcp_demo_d1__dense` is already loaded with 300 news articles, so search, filtering
-and grounded answers work the moment you connect. You also get the full write path:
-create your own index on the account, ingest into it, query it, delete it.
+and grounded answers work the moment you connect. You also get the write path:
+create your own index on the account, ingest into it and query it. Deletion is not
+available on this shared key: no index here can be deleted or reconfigured by hand.
+Whatever you create is removed automatically after 3 days.
 Reading files and pictures (the file loader and file indexing below, search by image)
 needs your own key: the shared demo key does not include them.
 
@@ -62,8 +64,9 @@ Know what you are working with:
 
 - **Anything you create there is deleted after 3 days.** Automatically, without warning
   or export. That includes indexes you created and every document in them.
-- **The account is shared with everyone reading this.** Your index is visible to them,
-  they can change or delete it, and you can do the same to theirs. Never put anything
+- **The account is shared with everyone reading this.** Your index is visible to them
+  and they can add documents to it, as you can to theirs. Nobody can delete or
+  reconfigure an index here (that is switched off for this key), but never put anything
   real, private or client-owned in it.
 - **The limits are per index, and deliberately small.** 200 MB of bandwidth and 50 MB
   of disk per index. Bandwidth is the one you will hit first: it covers a demo, a
