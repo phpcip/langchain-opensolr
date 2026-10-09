@@ -26,25 +26,31 @@ _log = logging.getLogger("opensolr")
 MGMT_BASE = "https://opensolr.com/solr_manager/api"
 AI_BASE = "https://api.opensolr.com/solr_manager/api"
 
-#: Convenience aliases for Opensolr's vector-enabled environments. The
-#: authoritative list is served live by the platform (``vector_regions``
-#: endpoint) — new regions become valid automatically, and additional
-#: dedicated regions can be deployed on request (paid): support@opensolr.com.
-VECTOR_LOCATIONS: Dict[str, str] = {
-    "us": "CHICAGO-96",
-    "de": "DE-SOLR-9",
-    "fi": "FINLAND9",
-}
+#: No region is written in the package: the vector regions are the servers with the Opensolr
+#: web crawler, whatever their Solr version, read live from ``vector_regions``. The name stays
+#: for code that imported it.
+VECTOR_LOCATIONS: Dict[str, str] = {}
 
 
-def resolve_location(location: str) -> str:
-    """Map a friendly alias ("us"/"de"/"fi") to its environment identifier.
+def resolve_location(location: str, regions: Optional[List[Dict[str, Any]]] = None) -> str:
+    """The environment id of a vector region, from the live ``vector_regions`` rows.
 
-    Unknown values pass through unchanged — validity is decided against the
-    live ``vector_regions`` list (or, ultimately, by the server), so newly
-    deployed vector regions work without a package upgrade.
+    ``location`` is an environment id (``CHICAGO-96``) or a short name: the first region, in
+    the platform's order, whose environment id or country starts with it, so ``us``, ``de`` or
+    ``fi`` keep working without any region written here. Without ``regions`` the text comes
+    back as given (``create_index`` resolves it against the live list).
     """
-    return VECTOR_LOCATIONS.get(location.strip().lower(), location.strip())
+    text = (location or "").strip()
+    if not regions or not text:
+        return text
+    low = text.lower()
+    for r in regions:
+        if str(r.get("environment", "")).lower() == low:
+            return str(r["environment"])
+    for r in regions:
+        if str(r.get("environment", "")).lower().startswith(low) or str(r.get("country", "")).lower().startswith(low):
+            return str(r["environment"])
+    return text
 
 #: Server-side limit for one batch_embed call.
 BATCH_EMBED_MAX = 50
@@ -884,34 +890,39 @@ class OpensolrClient:
         return info
 
     def vector_regions(self) -> List[Dict[str, str]]:
-        """Live list of vector-enabled environments (Solr 9.x + knn_vector +
-        hybrid parser): ``[{environment, country, solr_version}, ...]``.
+        """The vector regions, live: the servers with the Opensolr web crawler that are up,
+        whatever their Solr version: ``[{environment, country, solr_version}, ...]``.
 
         Cached per client. Additional dedicated regions can be deployed on
         request (paid) — contact support@opensolr.com.
         """
         if not hasattr(self, "_vector_regions_cache"):
             body = self.mgmt("vector_regions")
-            self._vector_regions_cache = body if isinstance(body, list) else []
+            if not isinstance(body, list):
+                raise OpensolrError(f"vector_regions: unexpected response: {str(body)[:200]}")
+            self._vector_regions_cache = body
         return self._vector_regions_cache
 
     def create_index(self, index: str, location: str = "us") -> Dict[str, Any]:
-        """Create a vector-enabled index in a vector location.
+        """Create a vector-enabled index in a vector region.
 
-        ``location`` is an alias ("us", "de", "fi") or a raw Opensolr
-        environment identifier. Validated against the live ``vector_regions``
-        list when reachable; otherwise the server has the final word.
+        ``location`` is an environment id from :meth:`vector_regions` or a short name matched
+        against that live list by environment id or country (``"us"``, ``"de"``, ``"fi"``).
+        Nothing is created when the list cannot be read or the location is not in it.
         """
-        env = resolve_location(location)
         try:
-            live = {r["environment"] for r in self.vector_regions()}
-        except OpensolrError:
-            live = set(VECTOR_LOCATIONS.values())  # offline fallback
-        if live and env not in live:
+            regions = self.vector_regions()
+        except OpensolrError as exc:
+            raise OpensolrError(f"create_index: the vector regions could not be read ({exc}); no index was created") from exc
+        live = [str(r.get("environment")) for r in regions if r.get("environment")]
+        if not live:
+            raise OpensolrError("create_index: the platform lists no vector region right now; no index was created")
+        env = resolve_location(location, regions)
+        if env not in live:
             raise ValueError(
-                f"{location!r} is not a vector-enabled Opensolr location. "
-                f"Currently available: {sorted(live)}. Additional regions can "
-                f"be deployed on request — contact support@opensolr.com."
+                f"{location!r} is not a vector region. The vector regions are the servers with the "
+                f"Opensolr web crawler: {', '.join(live)}. Additional regions can be deployed on "
+                f"request — contact support@opensolr.com."
             )
         # create_index reads its params from the query string (GET) server-side
         resp = self._post_with_retry(label="embed", url=

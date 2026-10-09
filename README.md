@@ -146,11 +146,13 @@ emb.embed_query("budget-friendly dining")   # -> 1024 floats
 
 ## Notes
 
-- Vector-enabled indexes run on Opensolr's Solr 9.x environments — currently
-  `us` (Chicago), `de` (Germany), `fi` (Finland). Pass `location=` to choose.
-  The list is fetched live from the platform, so new regions work without a
-  package upgrade — and **additional dedicated regions can be deployed on
-  request** (paid add-on): [support@opensolr.com](mailto:support@opensolr.com).
+- Vector indexes live in the **vector regions**: the Opensolr servers that run the
+  web crawler, whatever their Solr version. The list is live, never written in the
+  package: `client.vector_regions()` returns the regions that take new indexes right now
+  (environment id, country, Solr version). `location=` takes an environment id from
+  that list, or a short form such as `us`, `de` or `fi`, matched against the live
+  list by environment id or country. **Additional dedicated regions can be deployed
+  on request** (paid add-on): [support@opensolr.com](mailto:support@opensolr.com).
 - A free Opensolr account (free forever, no card) includes an AI quota that
   comfortably covers this README end to end:
   [opensolr.com](https://opensolr.com).
@@ -276,7 +278,9 @@ Everything this package does runs on an Opensolr index that sits in a **vector
 region** and carries the **Opensolr vector schema** — the configuration every
 Opensolr vector index runs. An index created through the package (`create_index`,
 `create_if_missing`) has both. An index made elsewhere may not: a server outside
-the vector regions, an older Solr version, or a schema of its own.
+the vector regions, or a schema of its own. A vector region is an Opensolr server
+that runs the web crawler, whatever its Solr version; the regions that take new
+indexes come from the live `vector_regions` list, never from a list in the package.
 
 **The check is automatic.** The first time the package touches an index, it asks
 the platform once whether that index can do what is asked: one request per index
@@ -412,7 +416,7 @@ and there.
 
 Every release is validated against **live Opensolr infrastructure** — no mocks:
 
-- **Unit tests** (offline): location aliases, filter→fq mapping, query building, escaping.
+- **Unit tests** (offline): location matching against the live region list, filter→fq mapping, query building, escaping.
 - **End-to-end suite**: the full write path through the async Data Ingestion
   queue (queued → server-side enrichment → searchable), semantic / hybrid /
   lexical retrieval, metadata round-trip, filters, id round-trip (your ids

@@ -1,8 +1,8 @@
 """Opensolr vector store for LangChain.
 
 A :class:`~langchain_core.vectorstores.VectorStore` backed by a managed,
-vector-enabled Opensolr index (Apache Solr 9.x, ``knn_vector`` 1024-dim,
-cosine). Embedding happens **server-side** on Opensolr's GPU infrastructure —
+vector-enabled Opensolr index (an index in a vector region: a server with the
+Opensolr web crawler, ``knn_vector`` 1024-dim, cosine). Embedding happens **server-side** on Opensolr's GPU infrastructure —
 no local embedding model or third-party API key is needed.
 
 Highlights:
@@ -156,14 +156,16 @@ class OpensolrVectorStore(VectorStore):
 
     Args:
         index: Name of the vector-enabled Opensolr index. Vector indexes live
-            on Opensolr's Solr 9.x environments (locations: ``us``, ``de``, ``fi``).
+            in the vector regions: the servers with the Opensolr web crawler,
+            listed live by ``client.vector_regions()``.
         email: Opensolr account email.
         api_key: Opensolr API key.
         client: Optional pre-configured :class:`OpensolrClient` (overrides
             email/api_key).
         location: Where to create the index if ``create_if_missing`` is set:
-            ``us`` (Chicago), ``de`` (Germany) or ``fi`` (Finland) — the
-            Opensolr environments with vector-enabled servers.
+            an environment id from ``client.vector_regions()``, or a short name
+            matched against that live list by environment id or country
+            (``us``, ``de``, ``fi`` …).
         create_if_missing: Create the index automatically on first use.
         text_field: Solr field holding page content (default ``text``).
         vector_field: Solr ``knn_vector`` field (default ``embeddings``).
